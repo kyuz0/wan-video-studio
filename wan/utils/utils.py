@@ -90,7 +90,8 @@ def load_and_merge_lora_weight(
             lora_params.append((key, value, lora_down_name, lora_up_name, lora_alpha_name))
     
     # Process LoRA parameters with progress bar
-    with tqdm(lora_params, desc="Merging LoRA weights on GPU") as pbar:
+    device_type = "GPU" if target_device.type == "cuda" else "CPU"
+    with tqdm(lora_params, desc=f"Merging LoRA weights on {device_type}") as pbar:
         for key, value, lora_down_name, lora_up_name, lora_alpha_name in pbar:
             # Tensors should already be on target device from load_file
             lora_down = lora_state_dict[lora_down_name]
@@ -106,14 +107,15 @@ def load_and_merge_lora_weight(
             rank = lora_down.shape[0]
             scaling_factor = lora_alpha / rank
             
-            # GPU matrix multiplication
-            with torch.cuda.device(target_device):
-                delta_W = scaling_factor * torch.matmul(lora_up, lora_down)
-                # Ensure dtype matches
-                if delta_W.dtype != value.dtype:
-                    delta_W = delta_W.to(value.dtype)
-                # GPU addition
-                value.data.add_(delta_W)
+            # Matrix multiplication on target device (GPU or CPU)
+            delta_W = scaling_factor * torch.matmul(lora_up, lora_down)
+            
+            # Ensure dtype matches
+            if delta_W.dtype != value.dtype:
+                delta_W = delta_W.to(value.dtype)
+            
+            # Add delta weights to original weights
+            value.data.add_(delta_W)
             
             pbar.set_postfix({"layer": key.split('.')[-2] if '.' in key else key})
     

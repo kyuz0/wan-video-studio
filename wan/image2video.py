@@ -134,6 +134,10 @@ class WanI2V:
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype)
+        # Add this debug line:
+        logging.info(f"Models loaded on device: {next(self.low_noise_model.parameters()).device}")
+        logging.info(f"Target device should be: {self.device}")
+        logging.info(f"init_on_cpu is: {self.init_on_cpu}")
         if use_sp:
             self.sp_size = get_world_size()
         else:

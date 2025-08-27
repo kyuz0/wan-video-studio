@@ -121,19 +121,21 @@ def load_and_merge_lora_weight(
     
     return model
 
-
 def load_and_merge_lora_weight_from_safetensors(
     model: nn.Module,
     lora_weight_path: str,
     lora_down_key: str = ".lora_down.weight",
     lora_up_key: str = ".lora_up.weight"):
     
-    # Determine target device from model
-    target_device = next(model.parameters()).device
+    # Check if CUDA is available and get first GPU device
+    if torch.cuda.is_available():
+        target_device = torch.device("cuda:0")
+        logging.info(f"Loading LoRA weights directly to {target_device}...")
+    else:
+        target_device = torch.device("cpu")
+        logging.info(f"Loading LoRA weights to {target_device}...")
     
-    logging.info(f"Loading LoRA weights directly to {target_device}...")
-    
-    # Use load_file instead of safe_open for direct GPU loading
+    # Use load_file with target device
     from safetensors.torch import load_file
     lora_state_dict = load_file(lora_weight_path, device=str(target_device))
     

@@ -75,21 +75,31 @@ def load_and_merge_lora_weight(
     lora_state_dict: dict,
     lora_down_key: str=".lora_down.weight",
     lora_up_key: str=".lora_up.weight"):
+    
     is_native_weight = any("diffusion_model." in key for key in lora_state_dict)
-    for key, value in model.named_parameters():
-        lora_down_name, lora_up_name, lora_alpha_name = build_lora_names(
-            key, lora_down_key, lora_up_key, is_native_weight
-        )
-        if lora_down_name in lora_state_dict:
-            lora_down = lora_state_dict[lora_down_name]
-            lora_up = lora_state_dict[lora_up_name]
-            lora_alpha = float(lora_state_dict[lora_alpha_name])
-            rank = lora_down.shape[0]
-            scaling_factor = lora_alpha / rank
-            assert lora_up.dtype == torch.float32
-            assert lora_down.dtype == torch.float32
-            delta_W = scaling_factor * torch.matmul(lora_up, lora_down)
-            value.data = value.data + delta_W
+    target_device = next(model.parameters()).device
+    
+    # Count total parameters for progress tracking
+    total_params = sum(1 for _ in model.named_parameters())
+    
+    with tqdm(model.named_parameters(), total=total_params, desc="Merging LoRA weights") as pbar:
+        for key, value in pbar:
+            lora_down_name, lora_up_name, lora_alpha_name = build_lora_names(
+                key, lora_down_key, lora_up_key, is_native_weight
+            )
+            if lora_down_name in lora_state_dict:
+                lora_down = lora_state_dict[lora_down_name].to(target_device)
+                lora_up = lora_state_dict[lora_up_name].to(target_device)
+                lora_alpha = float(lora_state_dict[lora_alpha_name])
+                rank = lora_down.shape[0]
+                scaling_factor = lora_alpha / rank
+                
+                # Perform computation on target device
+                delta_W = scaling_factor * torch.matmul(lora_up, lora_down)
+                value.data = value.data + delta_W.to(value.dtype)
+                
+                pbar.set_postfix({"current": key.split('.')[-1]})
+    
     return model
 
 
@@ -98,20 +108,22 @@ def load_and_merge_lora_weight_from_safetensors(
     lora_weight_path:str,
     lora_down_key:str=".lora_down.weight",
     lora_up_key:str=".lora_up.weight"):
+    
+    # Determine target device from model
+    target_device = next(model.parameters()).device
+    
+    logging.info("Loading LoRA weights...")
     lora_state_dict = {}
-    with safe_open(lora_weight_path, framework="pt", device="cpu") as f:
+    
+    # Load directly to target device for faster loading
+    device_str = "cpu" if target_device.type == "cpu" else str(target_device)
+    with safe_open(lora_weight_path, framework="pt", device=device_str) as f:
         for key in f.keys():
             lora_state_dict[key] = f.get_tensor(key)
+    
     model = load_and_merge_lora_weight(model, lora_state_dict, lora_down_key, lora_up_key)
+    logging.info("LoRA weights loaded and merged successfully")
     return model
-
-def rand_name(length=8, suffix=''):
-    name = binascii.b2a_hex(os.urandom(length)).decode('utf-8')
-    if suffix:
-        if not suffix.startswith('.'):
-            suffix = '.' + suffix
-        name += suffix
-    return name
 
 
 def save_video(tensor,

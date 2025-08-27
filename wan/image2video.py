@@ -102,11 +102,13 @@ class WanI2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
+        logging.info(f"Loading low noise model from {checkpoint_dir}...")
         self.low_noise_model = WanModel.from_pretrained(
             checkpoint_dir, subfolder=config.low_noise_checkpoint)
+        logging.info("Low noise model loaded successfully")
         if lora_dir:
             low_noise_lora_path = os.path.join(lora_dir, config.low_noise_lora_checkpoint)
+            logging.info("Applying LoRA weights to low noise model...")
             self.low_noise_model = load_and_merge_lora_weight_from_safetensors(self.low_noise_model, low_noise_lora_path)
         self.low_noise_model = self._configure_model(
             model=self.low_noise_model,
@@ -115,9 +117,12 @@ class WanI2V:
             shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype)
 
+        logging.info(f"Loading high noise model from {checkpoint_dir}...")
         self.high_noise_model = WanModel.from_pretrained(
             checkpoint_dir, subfolder=config.high_noise_checkpoint)
+        logging.info("High noise model loaded successfully")
         if lora_dir:
+            logging.info("Applying LoRA weights to high noise model...")
             high_noise_lora_path = os.path.join(lora_dir, config.high_noise_lora_checkpoint)
             self.high_noise_model = load_and_merge_lora_weight_from_safetensors(self.high_noise_model, high_noise_lora_path)
         self.high_noise_model = self._configure_model(
@@ -313,6 +318,7 @@ class WanI2V:
             n_prompt = self.sample_neg_prompt
 
         # preprocess
+        logging.info("Encoding text prompts...")
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
@@ -324,7 +330,9 @@ class WanI2V:
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
+        logging.info("Text encoding completed")
 
+        logging.info("Encoding input image...")
         y = self.vae.encode([
             torch.concat([
                 torch.nn.functional.interpolate(
@@ -334,6 +342,7 @@ class WanI2V:
             ],
                          dim=1).to(self.device)
         ])[0]
+        logging.info("Image encoding completed")
         y = torch.concat([msk, y])
 
         @contextmanager
@@ -444,8 +453,10 @@ class WanI2V:
                 torch.cuda.empty_cache()
 
             if self.rank == 0:
+                logging.info("Decoding video from latents...")
                 videos = self.vae.decode(x0)
-
+                logging.info("Video decoding completed")
+                
         del noise, latent, x0
         del sample_scheduler
         if offload_model:

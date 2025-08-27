@@ -4,6 +4,8 @@ import logging
 import os
 import sys
 import warnings
+import time
+from datetime import timedelta
 from datetime import datetime
 
 warnings.filterwarnings('ignore')
@@ -252,6 +254,7 @@ def _init_logging(rank):
 
 
 def generate(args):
+    script_start_time = time.time()
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     local_rank = int(os.getenv("LOCAL_RANK", 0))
@@ -481,6 +484,14 @@ def generate(args):
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
+
+    script_end_time = time.time()
+    script_duration = script_end_time - script_start_time
+    
+    if rank == 0:
+        logging.info(f"=== COMPLETE SCRIPT EXECUTION ===")
+        logging.info(f"Total script runtime: {timedelta(seconds=int(script_duration))}")
+    
 
     logging.info("Finished.")
 

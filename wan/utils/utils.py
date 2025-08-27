@@ -74,53 +74,66 @@ def build_lora_names(key, lora_down_key, lora_up_key, is_native_weight):
 def load_and_merge_lora_weight(
     model: nn.Module,
     lora_state_dict: dict,
-    lora_down_key: str=".lora_down.weight",
-    lora_up_key: str=".lora_up.weight"):
+    lora_down_key: str = ".lora_down.weight",
+    lora_up_key: str = ".lora_up.weight"):
     
     is_native_weight = any("diffusion_model." in key for key in lora_state_dict)
     target_device = next(model.parameters()).device
     
-    # Count total parameters for progress tracking
-    total_params = sum(1 for _ in model.named_parameters())
+    # Count LoRA parameters to process for progress bar
+    lora_params = []
+    for key, value in model.named_parameters():
+        lora_down_name, lora_up_name, lora_alpha_name = build_lora_names(
+            key, lora_down_key, lora_up_key, is_native_weight
+        )
+        if lora_down_name in lora_state_dict:
+            lora_params.append((key, value, lora_down_name, lora_up_name, lora_alpha_name))
     
-    with tqdm(model.named_parameters(), total=total_params, desc="Merging LoRA weights") as pbar:
-        for key, value in pbar:
-            lora_down_name, lora_up_name, lora_alpha_name = build_lora_names(
-                key, lora_down_key, lora_up_key, is_native_weight
-            )
-            if lora_down_name in lora_state_dict:
-                lora_down = lora_state_dict[lora_down_name].to(target_device)
-                lora_up = lora_state_dict[lora_up_name].to(target_device)
-                lora_alpha = float(lora_state_dict[lora_alpha_name])
-                rank = lora_down.shape[0]
-                scaling_factor = lora_alpha / rank
-                
-                # Perform computation on target device
+    # Process LoRA parameters with progress bar
+    with tqdm(lora_params, desc="Merging LoRA weights on GPU") as pbar:
+        for key, value, lora_down_name, lora_up_name, lora_alpha_name in pbar:
+            # Tensors should already be on target device from load_file
+            lora_down = lora_state_dict[lora_down_name]
+            lora_up = lora_state_dict[lora_up_name]
+            lora_alpha = float(lora_state_dict[lora_alpha_name])
+            
+            # Ensure tensors are on correct device (should be no-op if already correct)
+            if lora_down.device != target_device:
+                lora_down = lora_down.to(target_device)
+            if lora_up.device != target_device:
+                lora_up = lora_up.to(target_device)
+            
+            rank = lora_down.shape[0]
+            scaling_factor = lora_alpha / rank
+            
+            # GPU matrix multiplication
+            with torch.cuda.device(target_device):
                 delta_W = scaling_factor * torch.matmul(lora_up, lora_down)
-                value.data = value.data + delta_W.to(value.dtype)
-                
-                pbar.set_postfix({"current": key.split('.')[-1]})
+                # Ensure dtype matches
+                if delta_W.dtype != value.dtype:
+                    delta_W = delta_W.to(value.dtype)
+                # GPU addition
+                value.data.add_(delta_W)
+            
+            pbar.set_postfix({"layer": key.split('.')[-2] if '.' in key else key})
     
     return model
 
 
 def load_and_merge_lora_weight_from_safetensors(
     model: nn.Module,
-    lora_weight_path:str,
-    lora_down_key:str=".lora_down.weight",
-    lora_up_key:str=".lora_up.weight"):
+    lora_weight_path: str,
+    lora_down_key: str = ".lora_down.weight",
+    lora_up_key: str = ".lora_up.weight"):
     
     # Determine target device from model
     target_device = next(model.parameters()).device
     
-    logging.info("Loading LoRA weights...")
-    lora_state_dict = {}
+    logging.info(f"Loading LoRA weights directly to {target_device}...")
     
-    # Load directly to target device for faster loading
-    device_str = "cpu" if target_device.type == "cpu" else str(target_device)
-    with safe_open(lora_weight_path, framework="pt", device=device_str) as f:
-        for key in f.keys():
-            lora_state_dict[key] = f.get_tensor(key)
+    # Use load_file instead of safe_open for direct GPU loading
+    from safetensors.torch import load_file
+    lora_state_dict = load_file(lora_weight_path, device=str(target_device))
     
     model = load_and_merge_lora_weight(model, lora_state_dict, lora_down_key, lora_up_key)
     logging.info("LoRA weights loaded and merged successfully")

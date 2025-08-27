@@ -29,39 +29,28 @@ def create_test_tensor(frames, height, width, device):
     return torch.randn(3, frames, height, width, device=device, dtype=torch.float32)
 
 
-def benchmark_vae_operation(vae, operation, tensor, warmup_runs=2, test_runs=5):
-    """Benchmark a VAE operation (encode or decode) and return average time."""
-    # Warmup runs
-    for _ in range(warmup_runs):
-        with torch.no_grad():
-            if operation == 'encode':
-                _ = vae.encode([tensor])
-            else:  # decode
-                _ = vae.decode([tensor])
-        torch.cuda.synchronize() if tensor.device.type == 'cuda' else None
+def benchmark_vae_operation(vae, operation, tensor):
+    """Benchmark a VAE operation (encode or decode) - single run like real usage."""
+    # Single run, no warmup - matches real user experience
+    start_time = time.time()
+    with torch.no_grad():
+        if operation == 'encode':
+            result = vae.encode([tensor])
+        else:  # decode
+            result = vae.decode([tensor])
     
-    # Actual timing runs
-    times = []
-    for _ in range(test_runs):
-        start_time = time.time()
-        with torch.no_grad():
-            if operation == 'encode':
-                result = vae.encode([tensor])
-            else:  # decode
-                result = vae.decode([tensor])
-        
-        if tensor.device.type == 'cuda':
-            torch.cuda.synchronize()
-        
-        end_time = time.time()
-        times.append(end_time - start_time)
-        
-        # Clean up result
-        del result
-        if tensor.device.type == 'cuda':
-            torch.cuda.empty_cache()
+    if tensor.device.type == 'cuda':
+        torch.cuda.synchronize()
     
-    return np.mean(times), np.std(times)
+    end_time = time.time()
+    elapsed = end_time - start_time
+    
+    # Clean up result
+    del result
+    if tensor.device.type == 'cuda':
+        torch.cuda.empty_cache()
+    
+    return elapsed
 
 
 def main():
@@ -136,8 +125,8 @@ def main():
             
             # Test encoding
             print("  Testing encode...", end=" ", flush=True)
-            encode_time, encode_std = benchmark_vae_operation(vae, 'encode', test_tensor)
-            print(f"{encode_time:.2f}s ±{encode_std:.2f}s")
+            encode_time = benchmark_vae_operation(vae, 'encode', test_tensor)
+            print(f"{encode_time:.2f}s")
             
             # Get encoded tensor for decode test
             with torch.no_grad():
@@ -147,8 +136,8 @@ def main():
             
             # Test decoding
             print("  Testing decode...", end=" ", flush=True)
-            decode_time, decode_std = benchmark_vae_operation(vae, 'decode', encoded)
-            print(f"{decode_time:.2f}s ±{decode_std:.2f}s")
+            decode_time = benchmark_vae_operation(vae, 'decode', encoded)
+            print(f"{decode_time:.2f}s")
             
             # Store results
             results['encode_results'].append({
@@ -158,7 +147,6 @@ def main():
                 'width': width,
                 'tensor_size_mb': tensor_size_mb,
                 'time_mean': encode_time,
-                'time_std': encode_std,
                 'throughput_mb_per_sec': tensor_size_mb / encode_time
             })
             
@@ -169,7 +157,6 @@ def main():
                 'width': width, 
                 'encoded_size_mb': encoded_size_mb,
                 'time_mean': decode_time,
-                'time_std': decode_std
             })
             
             # Cleanup

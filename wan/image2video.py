@@ -479,7 +479,7 @@ class WanI2V:
                 torch.cuda.empty_cache()
 
             if self.rank == 0:
-                 logging.info("Decoding video from latents...")
+                logging.info("Decoding video from latents...")
             
                 # Estimate decode timing
                 estimated_decode_time = estimate_vae_time(F, h, w, "decode", self.vae_timing_data)

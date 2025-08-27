@@ -144,6 +144,7 @@ class WanI2V:
             self.sp_size = 1
 
         self.sample_neg_prompt = config.sample_neg_prompt
+        self.vae_timing_data = load_vae_timing_model()
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -353,8 +354,21 @@ class WanI2V:
         logging.info(f"Video tensor size: {tensor_size_mb:.1f} MB ({video_tensor.shape})")
         
         logging.info("Running VAE encoder...")
+        
+        # Estimate timing and start progress tracker
+        estimated_time = estimate_vae_time(F, h, w, "encode", "2.1", self.vae_timing_data)
+        progress_tracker = VAEProgressTracker(estimated_time, "VAE encoding")
+        
+        progress_tracker.start()
+        start_time = time.time()
+        
         y = self.vae.encode([video_tensor])[0]
-        logging.info("VAE encoding completed")
+        
+        actual_time = time.time() - start_time
+        progress_tracker.stop()
+        
+        logging.info(f"VAE encoding completed in {actual_time:.1f}s")
+
         y = torch.concat([msk, y])
 
         @contextmanager
@@ -465,9 +479,21 @@ class WanI2V:
                 torch.cuda.empty_cache()
 
             if self.rank == 0:
-                logging.info("Decoding video from latents...")
+                 logging.info("Decoding video from latents...")
+            
+                # Estimate decode timing
+                estimated_decode_time = estimate_vae_time(F, h, w, "decode", self.vae_timing_data)
+                decode_tracker = VAEProgressTracker(estimated_decode_time, "VAE decoding")
+                
+                decode_tracker.start()
+                start_time = time.time()
+                
                 videos = self.vae.decode(x0)
-                logging.info("Video decoding completed")
+                
+                actual_time = time.time() - start_time
+                decode_tracker.stop()
+                
+                logging.info(f"Video decoding completed in {actual_time:.1f}s")
 
         del noise, latent, x0
         del sample_scheduler

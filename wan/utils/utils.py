@@ -10,8 +10,99 @@ import torch
 import torchvision
 from tqdm import tqdm
 from safetensors import safe_open
+import threading
+import time
+from tqdm import tqdm
 
 __all__ = ['save_video', 'save_image', 'str2bool', "use_cfg", "model_safe_downcast", "load_and_merge_lora_weight_from_safetensors"]
+
+class VAEProgressTracker:
+    def __init__(self, estimated_time, operation="VAE operation"):
+        self.estimated_time = estimated_time
+        self.operation = operation
+        self.start_time = None
+        self.pbar = None
+        self.running = False
+        self.thread = None
+    
+    def start(self):
+        """Start the progress tracker."""
+        if not self.estimated_time:
+            return
+        
+        self.start_time = time.time()
+        self.running = True
+        
+        # Create progress bar
+        self.pbar = tqdm(
+            total=100, 
+            desc=self.operation,
+            unit="%",
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| {elapsed}/{postfix}"
+        )
+        
+        # Start background thread
+        self.thread = threading.Thread(target=self._update_progress)
+        self.thread.daemon = True
+        self.thread.start()
+    
+    def stop(self):
+        """Stop the progress tracker."""
+        self.running = False
+        if self.thread:
+            self.thread.join()
+        if self.pbar:
+            elapsed = time.time() - self.start_time if self.start_time else 0
+            self.pbar.set_postfix_str(f"{elapsed:.1f}s")
+            self.pbar.n = 100
+            self.pbar.refresh()
+            self.pbar.close()
+    
+    def _update_progress(self):
+        """Background thread to update progress bar."""
+        while self.running:
+            if self.start_time:
+                elapsed = time.time() - self.start_time
+                percentage = min(95, (elapsed / self.estimated_time) * 100)  # Cap at 95% until done
+                
+                self.pbar.n = percentage
+                self.pbar.set_postfix_str(f"{self.estimated_time:.1f}s")
+                self.pbar.refresh()
+            
+            time.sleep(0.5)  # Update every 0.5 seconds
+
+
+def load_vae_timing_model(benchmark_file="vae_benchmark_results.json"):
+    """Load VAE timing predictions from benchmark results."""
+    try:
+        if os.path.exists(benchmark_file):
+            with open(benchmark_file, 'r') as f:
+                data = json.load(f)
+            return data
+    except:
+        pass
+    return None
+
+def estimate_vae_time(frames, height, width, operation="encode", timing_data=None):
+    """Estimate VAE operation time for i2v-A14B usage."""
+    if not timing_data:
+        return None
+    
+    model_key = f'{operation}_model'
+    model = timing_data.get(model_key)
+    if not model:
+        return None
+    
+    # Model: time = baseline + frame_factor*frames + pixel_factor*pixels  
+    baseline = model.get('baseline', 0)
+    frame_factor = model.get('frame_factor', 0)
+    pixel_factor = model.get('pixel_factor', 0)
+    
+    pixels = height * width
+    estimated_time = baseline + frame_factor * frames + pixel_factor * pixels
+    
+    return max(0.5, estimated_time)  # Minimum 0.5 seconds
+
 
 def use_cfg(cfg_scale:float=1.0, eps:float=1e-6):
     return abs(cfg_scale - 1.0) > eps

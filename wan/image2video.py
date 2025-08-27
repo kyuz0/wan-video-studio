@@ -83,8 +83,11 @@ class WanI2V:
         self.boundary = config.boundary
         self.param_dtype = config.param_dtype
 
+        # Force GPU placement for single-GPU usage
         if t5_fsdp or dit_fsdp or use_sp:
             self.init_on_cpu = False
+        elif torch.cuda.is_available():
+            self.init_on_cpu = False  # Force GPU for single-GPU when CUDA available
 
         shard_fn = partial(shard_model, device_id=device_id)
         self.text_encoder = T5EncoderModel(
@@ -456,7 +459,7 @@ class WanI2V:
                 logging.info("Decoding video from latents...")
                 videos = self.vae.decode(x0)
                 logging.info("Video decoding completed")
-                
+
         del noise, latent, x0
         del sample_scheduler
         if offload_model:

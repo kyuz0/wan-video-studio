@@ -85,8 +85,9 @@ def main():
         (1280, 704, "1280x704"),   # ti2v-5B
     ]
     
-    # Frame counts to test (based on actual usage patterns)
-    frame_counts = [81, 121]  # Most common frame counts in configs
+    # Frame counts to test (small counts for fast benchmarking)
+    # Note: Frame counts are always 4n+1 in Wan configs
+    frame_counts = [5, 9, 17]  # Small counts to extrapolate from
     
     # Generate test configurations
     test_configs = []
@@ -196,24 +197,55 @@ def main():
             
             print()
         
-        # Create simple prediction model for this VAE
+        # Create prediction models for this VAE
         encode_data = results['encode_results']
-        if encode_data:
-            # Simple linear regression on tensor size
-            sizes = [r['tensor_size_mb'] for r in encode_data]
-            times = [r['time_mean'] for r in encode_data]
+        if len(encode_data) >= 3:  # Need at least 3 points for good extrapolation
+            # Build linear model: time = baseline + (frames * frame_factor) + (pixels * pixel_factor)
+            frames_list = [r['frames'] for r in encode_data]
+            pixels_list = [r['height'] * r['width'] for r in encode_data]  
+            times_list = [r['time_mean'] for r in encode_data]
             
-            # Calculate slope (time per MB)
-            time_per_mb = np.mean([t/s for s, t in zip(sizes, times)])
+            # Simple multi-variable linear regression
+            # We'll use frames as primary predictor since that's what varies most
+            import numpy as np
             
-            print(f"\n=== PREDICTION MODEL for VAE {vae_name} ===")
-            print(f"Average encode time: {time_per_mb:.4f} seconds per MB")
+            # Model: time = a + b*frames + c*pixels
+            X = np.array([[1, f, p] for f, p in zip(frames_list, pixels_list)])
+            y = np.array(times_list)
             
-            # Store prediction model
-            results['prediction_model'] = {
-                'encode_time_per_mb': time_per_mb,
-                'r_squared': np.corrcoef(sizes, times)[0,1]**2 if len(sizes) > 1 else 0
-            }
+            try:
+                # Solve for coefficients
+                coeffs = np.linalg.lstsq(X, y, rcond=None)[0]
+                baseline, frame_factor, pixel_factor = coeffs
+                
+                # Calculate R-squared
+                y_pred = X @ coeffs
+                r_squared = 1 - np.sum((y - y_pred)**2) / np.sum((y - np.mean(y))**2)
+                
+                print(f"\n=== PREDICTION MODEL for VAE {vae_name} ===")
+                print(f"Model: time = {baseline:.3f} + {frame_factor:.4f}*frames + {pixel_factor:.8f}*pixels")
+                print(f"R-squared: {r_squared:.3f}")
+                
+                # Test predictions for common frame counts
+                for test_frames in [81, 121]:
+                    for height, width, desc in [(832, 480, "832x480"), (720, 1280, "720x1280")]:
+                        test_pixels = height * width
+                        predicted_time = baseline + frame_factor * test_frames + pixel_factor * test_pixels
+                        print(f"  Predicted {test_frames}f {desc}: {predicted_time:.1f}s")
+                
+                # Store prediction model
+                results['prediction_model'] = {
+                    'baseline': float(baseline),
+                    'frame_factor': float(frame_factor), 
+                    'pixel_factor': float(pixel_factor),
+                    'r_squared': float(r_squared)
+                }
+                
+            except np.linalg.LinAlgError:
+                print(f"Could not create prediction model for VAE {vae_name}")
+                
+        else:
+            print(f"Not enough data points to create prediction model for VAE {vae_name}")
         
         all_results[f'vae_{vae_name}'] = results
         print()

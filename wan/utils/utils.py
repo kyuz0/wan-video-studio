@@ -8,6 +8,7 @@ import torch.nn as nn
 import imageio
 import torch
 import torchvision
+from tqdm import tqdm
 from safetensors import safe_open
 
 __all__ = ['save_video', 'save_image', 'str2bool', "use_cfg", "model_safe_downcast", "load_and_merge_lora_weight_from_safetensors"]

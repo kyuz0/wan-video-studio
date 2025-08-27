@@ -339,17 +339,22 @@ class WanI2V:
             context_null = [t.to(self.device) for t in context_null]
         logging.info("Text encoding completed")
 
-        logging.info("Encoding input image...")
-        y = self.vae.encode([
-            torch.concat([
-                torch.nn.functional.interpolate(
-                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
-                torch.zeros(3, F - 1, h, w)
-            ],
-                         dim=1).to(self.device)
-        ])[0]
-        logging.info("Image encoding completed")
+        # Prepare video tensor
+        logging.info(f"Preparing video tensor: {F} frames at {h}x{w} resolution")
+        resized_img = torch.nn.functional.interpolate(
+            img[None].cpu(), size=(h, w), mode='bicubic').transpose(0, 1)
+        
+        video_tensor = torch.concat([
+            resized_img,
+            torch.zeros(3, F - 1, h, w)
+        ], dim=1).to(self.device)
+        
+        tensor_size_mb = video_tensor.numel() * video_tensor.element_size() / (1024 * 1024)
+        logging.info(f"Video tensor size: {tensor_size_mb:.1f} MB ({video_tensor.shape})")
+        
+        logging.info("Running VAE encoder...")
+        y = self.vae.encode([video_tensor])[0]
+        logging.info("VAE encoding completed")
         y = torch.concat([msk, y])
 
         @contextmanager

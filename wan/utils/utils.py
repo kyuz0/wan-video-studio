@@ -78,7 +78,6 @@ def load_and_merge_lora_weight(
     lora_up_key: str = ".lora_up.weight"):
     
     is_native_weight = any("diffusion_model." in key for key in lora_state_dict)
-    target_device = next(model.parameters()).device
     
     # Count LoRA parameters to process for progress bar
     lora_params = []
@@ -89,28 +88,29 @@ def load_and_merge_lora_weight(
         if lora_down_name in lora_state_dict:
             lora_params.append((key, value, lora_down_name, lora_up_name, lora_alpha_name))
     
+    # Detect device from LoRA tensors (not model parameters)
+    if lora_params:
+        first_lora_tensor = lora_state_dict[lora_params[0][2]]  # First lora_down tensor
+        device_type = "GPU" if first_lora_tensor.device.type == "cuda" else "CPU"
+    else:
+        device_type = "CPU"
+    
     # Process LoRA parameters with progress bar
-    device_type = "GPU" if target_device.type == "cuda" else "CPU"
     with tqdm(lora_params, desc=f"Merging LoRA weights on {device_type}") as pbar:
         for key, value, lora_down_name, lora_up_name, lora_alpha_name in pbar:
-            # Tensors should already be on target device from load_file
             lora_down = lora_state_dict[lora_down_name]
             lora_up = lora_state_dict[lora_up_name]
             lora_alpha = float(lora_state_dict[lora_alpha_name])
             
-            # Ensure tensors are on correct device (should be no-op if already correct)
-            if lora_down.device != target_device:
-                lora_down = lora_down.to(target_device)
-            if lora_up.device != target_device:
-                lora_up = lora_up.to(target_device)
-            
             rank = lora_down.shape[0]
             scaling_factor = lora_alpha / rank
             
-            # Matrix multiplication on target device (GPU or CPU)
+            # Matrix multiplication on the device where LoRA tensors are
             delta_W = scaling_factor * torch.matmul(lora_up, lora_down)
             
-            # Ensure dtype matches
+            # Move delta_W to model's device if different and ensure dtype matches
+            if delta_W.device != value.device:
+                delta_W = delta_W.to(value.device)
             if delta_W.dtype != value.dtype:
                 delta_W = delta_W.to(value.dtype)
             

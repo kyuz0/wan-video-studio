@@ -357,8 +357,6 @@ class WanI2V:
         logging.info("VAE encoding completed")
         y = torch.concat([msk, y])
 
-        y = torch.concat([msk, y])
-
         @contextmanager
         def noop_no_sync():
             yield

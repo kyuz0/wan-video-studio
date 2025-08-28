@@ -39,16 +39,22 @@ EXAMPLE_PROMPT = {
     },
 }
 
-def save_video_to_file(video, save_dir:str, test_idx:int, seed:int, prompt:str, task:str, fps:float):
-    formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    formatted_prompt = prompt.replace(" ", "_").replace("/", "_")[:50]
-    suffix = '.mp4'
-    file_name = f"{task}_{test_idx:04d}_seed{seed}_{formatted_prompt}_{formatted_time}{suffix}"
-    save_file = os.path.join(save_dir, file_name)
-    logging.info(f"Saving generated video to {save_file}")
+def save_video_to_file(video, save_dir: str, test_idx: int, seed: int, prompt: str, task: str, fps: float, save_file: str = None):
+    if save_file:
+        # Use provided filename
+        save_file_path = save_file
+    else:
+        # Generate automatic filename
+        formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        formatted_prompt = prompt.replace(" ", "_").replace("/", "_")[:50]
+        suffix = '.mp4'
+        file_name = f"{task}_{test_idx:04d}_seed{seed}_{formatted_prompt}_{formatted_time}{suffix}"
+        save_file_path = os.path.join(save_dir, file_name)
+    
+    logging.info(f"Saving generated video to {save_file_path}")
     save_video(
         tensor=video[None],
-        save_file=save_file,
+        save_file=save_file_path,
         fps=fps,
         nrow=1,
         normalize=True,
@@ -395,7 +401,8 @@ def generate(args):
                     seed=args.base_seed,
                     prompt=prompt,
                     task=args.task,
-                    fps=cfg.sample_fps
+                    fps=cfg.sample_fps,
+                    save_file=args.save_file
                 )
             del video
 
@@ -436,7 +443,8 @@ def generate(args):
                     seed=args.base_seed,
                     prompt=prompt,
                     task=args.task,
-                    fps=cfg.sample_fps
+                    fps=cfg.sample_fps,
+                    save_file=args.save_file
                 )
             del video
 
@@ -476,7 +484,8 @@ def generate(args):
                     seed=args.base_seed,
                     prompt=prompt,
                     task=args.task,
-                    fps=cfg.sample_fps
+                    fps=cfg.sample_fps,
+                    save_file=args.save_file
                 )
             del video
 

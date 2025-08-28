@@ -27,7 +27,7 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.fm_solvers_euler import EulerScheduler
-from .utils.utils import model_safe_downcast, load_and_merge_lora_weight_from_safetensors, use_cfg
+from .utils.utils import model_safe_downcast, load_and_merge_lora_weight_from_safetensors, use_cfg, SimpleTimer
 
 class WanT2V:
 
@@ -81,8 +81,11 @@ class WanT2V:
         self.boundary = config.boundary
         self.param_dtype = config.param_dtype
 
+        # Force GPU placement for single-GPU usage
         if t5_fsdp or dit_fsdp or use_sp:
             self.init_on_cpu = False
+        elif torch.cuda.is_available():
+            self.init_on_cpu = False  # Force GPU for single-GPU when CUDA available
 
         shard_fn = partial(shard_model, device_id=device_id)
         self.text_encoder = T5EncoderModel(
@@ -99,11 +102,13 @@ class WanT2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
+        logging.info(f"Loading low noise model from {checkpoint_dir}...")
         self.low_noise_model = WanModel.from_pretrained(
             checkpoint_dir, subfolder=config.low_noise_checkpoint)
+        logging.info("Low noise model loaded successfully")
         if lora_dir:
             low_noise_lora_path = os.path.join(lora_dir, config.low_noise_lora_checkpoint)
+            logging.info("Applying LoRA weights to low noise model...")
             self.low_noise_model = load_and_merge_lora_weight_from_safetensors(self.low_noise_model, low_noise_lora_path)
         self.low_noise_model = self._configure_model(
             model=self.low_noise_model,
@@ -112,10 +117,13 @@ class WanT2V:
             shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype)
 
+        logging.info(f"Loading high noise model from {checkpoint_dir}...")
         self.high_noise_model = WanModel.from_pretrained(
             checkpoint_dir, subfolder=config.high_noise_checkpoint)
+        logging.info("High noise model loaded successfully")
         if lora_dir:
             high_noise_lora_path = os.path.join(lora_dir, config.high_noise_lora_checkpoint)
+            logging.info("Applying LoRA weights to high noise model...")
             self.high_noise_model = load_and_merge_lora_weight_from_safetensors(self.high_noise_model, high_noise_lora_path)
         self.high_noise_model = self._configure_model(
             model=self.high_noise_model,
@@ -278,6 +286,7 @@ class WanT2V:
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
 
+        logging.info("Encoding text prompts...")
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
@@ -289,6 +298,7 @@ class WanT2V:
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
+        logging.info("Text encoding completed")
 
         noise = [
             torch.randn(
@@ -390,7 +400,10 @@ class WanT2V:
                 self.high_noise_model.cpu()
                 torch.cuda.empty_cache()
             if self.rank == 0:
+                decode_timer = SimpleTimer("VAE decoding")
+                decode_timer.start()
                 videos = self.vae.decode(x0)
+                decode_timer.stop()
 
         del noise, latents
         del sample_scheduler

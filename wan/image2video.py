@@ -29,7 +29,7 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.fm_solvers_euler import EulerScheduler
-from .utils.utils import model_safe_downcast, load_and_merge_lora_weight_from_safetensors, use_cfg
+from .utils.utils import model_safe_downcast, load_and_merge_lora_weight_from_safetensors, use_cfg, SimpleTimer
 
 class WanI2V:
 
@@ -352,9 +352,12 @@ class WanI2V:
         tensor_size_mb = video_tensor.numel() * video_tensor.element_size() / (1024 * 1024)
         logging.info(f"Video tensor size: {tensor_size_mb:.1f} MB ({video_tensor.shape})")
         
-        logging.info("Running VAE encoder...")
+        # VAE encoding with timer
+        encode_timer = SimpleTimer("VAE encoding")
+        encode_timer.start()
         y = self.vae.encode([video_tensor])[0]
-        logging.info("VAE encoding completed")
+        encode_timer.stop()
+        
         y = torch.concat([msk, y])
 
         @contextmanager
@@ -465,9 +468,10 @@ class WanI2V:
                 torch.cuda.empty_cache()
 
             if self.rank == 0:
-                logging.info("Decoding video from latents...")
+                decode_timer = SimpleTimer("VAE decoding")
+                decode_timer.start()
                 videos = self.vae.decode(x0)
-                logging.info("Video decoding completed")
+                decode_timer.stop()
 
         del noise, latent, x0
         del sample_scheduler

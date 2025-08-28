@@ -16,6 +16,52 @@ from tqdm import tqdm
 
 __all__ = ['save_video', 'save_image', 'str2bool', "use_cfg", "model_safe_downcast", "load_and_merge_lora_weight_from_safetensors"]
 
+class SimpleTimer:
+    def __init__(self, operation_name="Operation"):
+        self.operation_name = operation_name
+        self.start_time = None
+        self.running = False
+        self.thread = None
+    
+    def start(self):
+        """Start the timer."""
+        self.start_time = time.time()
+        self.running = True
+        logging.info(f"{self.operation_name} started...")
+        
+        # Start background thread to log elapsed time
+        self.thread = threading.Thread(target=self._log_progress)
+        self.thread.daemon = True
+        self.thread.start()
+    
+    def stop(self):
+        """Stop the timer and log final time."""
+        self.running = False
+        if self.thread:
+            self.thread.join()
+        
+        if self.start_time:
+            elapsed = time.time() - self.start_time
+            logging.info(f"{self.operation_name} completed in {self._format_time(elapsed)}")
+    
+    def _log_progress(self):
+        """Background thread to log elapsed time every 10 seconds."""
+        while self.running:
+            time.sleep(10)  # Log every 10 seconds
+            if self.running and self.start_time:
+                elapsed = time.time() - self.start_time
+                logging.info(f"{self.operation_name} running... {self._format_time(elapsed)} elapsed")
+    
+    def _format_time(self, seconds):
+        """Format seconds as MM:SS or HH:MM:SS."""
+        if seconds < 3600:  # Less than 1 hour
+            return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
+        else:  # 1 hour or more
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            secs = int(seconds % 60)
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+
 def use_cfg(cfg_scale:float=1.0, eps:float=1e-6):
     return abs(cfg_scale - 1.0) > eps
 

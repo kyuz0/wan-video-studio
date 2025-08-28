@@ -12,6 +12,7 @@ from tqdm import tqdm
 from safetensors import safe_open
 import threading
 import time
+import sys
 from tqdm import tqdm
 
 __all__ = ['save_video', 'save_image', 'str2bool', "use_cfg", "model_safe_downcast", "load_and_merge_lora_weight_from_safetensors"]
@@ -27,10 +28,10 @@ class SimpleTimer:
         """Start the timer."""
         self.start_time = time.time()
         self.running = True
-        logging.info(f"{self.operation_name} started...")
+        print(f"{self.operation_name}...", end="", flush=True)
         
-        # Start background thread to log elapsed time
-        self.thread = threading.Thread(target=self._log_progress)
+        # Start background thread for in-place timer
+        self.thread = threading.Thread(target=self._update_timer)
         self.thread.daemon = True
         self.thread.start()
     
@@ -42,15 +43,17 @@ class SimpleTimer:
         
         if self.start_time:
             elapsed = time.time() - self.start_time
-            logging.info(f"{self.operation_name} completed in {self._format_time(elapsed)}")
+            # Clear the line and show final result
+            print(f"\r{self.operation_name} completed in {self._format_time(elapsed)}")
     
-    def _log_progress(self):
-        """Background thread to log elapsed time every 10 seconds."""
+    def _update_timer(self):
+        """Background thread to update timer in place."""
         while self.running:
-            time.sleep(10)  # Log every 10 seconds
+            time.sleep(1)  # Update every second
             if self.running and self.start_time:
                 elapsed = time.time() - self.start_time
-                logging.info(f"{self.operation_name} running... {self._format_time(elapsed)} elapsed")
+                # Overwrite same line with current elapsed time
+                print(f"\r{self.operation_name}... {self._format_time(elapsed)} elapsed", end="", flush=True)
     
     def _format_time(self, seconds):
         """Format seconds as MM:SS or HH:MM:SS."""

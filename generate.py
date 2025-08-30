@@ -198,7 +198,7 @@ def _parse_args():
     parser.add_argument(
         "--prompt_extend_target_lang",
         type=str,
-        default="zh",
+        default="en",
         choices=["zh", "en"],
         help="The target language of prompt extend.")
     parser.add_argument(
@@ -364,7 +364,9 @@ def generate(args):
         if dist.is_initialized():
             dist.broadcast_object_list(prompt_list, src=0)
 
-        logging.info(f"Extended prompt: {args.prompt}")
+        for i, extended_prompt in enumerate(prompt_list):
+        if extended_prompt:  # Check for None in multi-rank case
+            logging.info(f"Extended prompt {i}: {extended_prompt}")
 
     if "t2v" in args.task:
         logging.info("Creating WanT2V pipeline.")

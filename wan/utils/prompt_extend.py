@@ -9,6 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Optional, Union
+import gc
 
 import dashscope
 import torch
@@ -297,6 +298,8 @@ class QwenPromptExpander(PromptExpander):
                                                       in self.model_dict):
             self.model_name = self.model_dict[self.model_name]
 
+        target_device = f"cuda:{self.device}" if torch.cuda.is_available() else "cpu"
+
         if self.is_vl:
             # default: Load the model on the available device(s)
             from transformers import (
@@ -322,7 +325,7 @@ class QwenPromptExpander(PromptExpander):
                 torch.float16 if "AWQ" in self.model_name else "auto",
                 attn_implementation="flash_attention_2"
                 if FLASH_VER == 2 else None,
-                device_map="cpu")
+                device_map=target_device)
         else:
             from transformers import AutoModelForCausalLM, AutoTokenizer
             self.model = AutoModelForCausalLM.from_pretrained(
@@ -331,11 +334,10 @@ class QwenPromptExpander(PromptExpander):
                 if "AWQ" in self.model_name else "auto",
                 attn_implementation="flash_attention_2"
                 if FLASH_VER == 2 else None,
-                device_map="cpu")
+                device_map=target_device)
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
     def extend(self, prompt, system_prompt, seed=-1, *args, **kwargs):
-        self.model = self.model.to(self.device)
         messages = [{
             "role": "system",
             "content": system_prompt
@@ -356,7 +358,12 @@ class QwenPromptExpander(PromptExpander):
 
         expanded_prompt = self.tokenizer.batch_decode(
             generated_ids, skip_special_tokens=True)[0]
-        self.model = self.model.to("cpu")
+
+        # Proper cleanup - completely free memory
+        del self.model
+        del self.tokenizer
+        torch.cuda.empty_cache()
+        gc.collect()
         return PromptOutput(
             status=True,
             prompt=expanded_prompt,
@@ -372,7 +379,6 @@ class QwenPromptExpander(PromptExpander):
                         seed=-1,
                         *args,
                         **kwargs):
-        self.model = self.model.to(self.device)
         messages = [{
             'role': 'system',
             'content': [{
@@ -417,7 +423,14 @@ class QwenPromptExpander(PromptExpander):
             generated_ids_trimmed,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False)[0]
-        self.model = self.model.to("cpu")
+
+        # Unload / cleanup
+        del self.model
+        if hasattr(self, 'processor'):
+            del self.processor
+        torch.cuda.empty_cache()
+        gc.collect()
+
         return PromptOutput(
             status=True,
             prompt=expanded_prompt,

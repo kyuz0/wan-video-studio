@@ -365,8 +365,8 @@ def generate(args):
             dist.broadcast_object_list(prompt_list, src=0)
 
         for i, extended_prompt in enumerate(prompt_list):
-        if extended_prompt:  # Check for None in multi-rank case
-            logging.info(f"Extended prompt {i}: {extended_prompt}")
+            if extended_prompt:  # Check for None in multi-rank case
+                logging.info(f"Extended prompt {i}: {extended_prompt}")
 
     if "t2v" in args.task:
         logging.info("Creating WanT2V pipeline.")

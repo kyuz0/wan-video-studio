@@ -3,3 +3,5 @@ from . import configs, distributed, modules
 from .image2video import WanI2V
 from .text2video import WanT2V
 from .textimage2video import WanTI2V
+from .speech2video import WanS2V
+

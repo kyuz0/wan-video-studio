@@ -525,6 +525,13 @@ def generate(args):
             offload_model=args.offload_model,
             init_first_frame=args.start_from_ref,
         )
+        # DEBUG: Add these lines
+        print(f"DEBUG: rank = {rank}")
+        print(f"DEBUG: video is None = {video is None}")
+        print(f"DEBUG: video type = {type(video)}")
+        if video is not None:
+            print(f"DEBUG: video shape = {video.shape}")
+        print(f"DEBUG: About to check rank == 0: {rank == 0}")
     else:
         logging.info("Creating WanI2V pipeline.")
         wan_i2v = wan.WanI2V(

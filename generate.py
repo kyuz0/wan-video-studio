@@ -525,13 +525,6 @@ def generate(args):
             offload_model=args.offload_model,
             init_first_frame=args.start_from_ref,
         )
-        # DEBUG: Add these lines
-        print(f"DEBUG: rank = {rank}")
-        print(f"DEBUG: video is None = {video is None}")
-        print(f"DEBUG: video type = {type(video)}")
-        if video is not None:
-            print(f"DEBUG: video shape = {video.shape}")
-        print(f"DEBUG: About to check rank == 0: {rank == 0}")
     else:
         logging.info("Creating WanI2V pipeline.")
         wan_i2v = wan.WanI2V(
@@ -586,10 +579,27 @@ def generate(args):
     script_end_time = time.time()
     script_duration = script_end_time - script_start_time
     
+
     if rank == 0:
+        if args.save_file is None:
+            formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            formatted_prompt = args.prompt.replace(" ", "_").replace("/", "_")[:50]
+            suffix = '.mp4'
+            args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{formatted_prompt}_{formatted_time}" + suffix
+
+        logging.info(f"Saving generated video to {args.save_file}")
+        save_video(
+            tensor=video[None],
+            save_file=args.save_file,
+            fps=cfg.sample_fps,
+            nrow=1,
+            normalize=True,
+            value_range=(-1, 1))
+        if "s2v" in args.task:
+            merge_video_audio(video_path=args.save_file, audio_path=args.audio)
         logging.info(f"=== COMPLETE SCRIPT EXECUTION ===")
         logging.info(f"Total script runtime: {timedelta(seconds=int(script_duration))}")
-    
+    del video
 
     logging.info("Finished.")
 

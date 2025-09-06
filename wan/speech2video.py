@@ -281,9 +281,10 @@ class WanS2V:
             _cond = cond.to(dtype=self.param_dtype, device=self.device)
             if getattr(self, "use_vae_tiling", False):
                 _lat = tiled_encode(self.vae, _cond[0], tile_px=getattr(self, "vae_tile_px", 128))
+                cond_lat = _lat.unsqueeze(0)[:, :, 1:].contiguous().cpu()  # [1, 16, Tl-1, HL, WL]
             else:
                 _lat = torch.stack(self.vae.encode(_cond))
-            cond_lat = _lat[:, :, 1:].cpu()
+                cond_lat = _lat[:, :, 1:].cpu()
             COND.append(cond_lat)
             
         vae_timer.stop()
@@ -362,7 +363,7 @@ class WanS2V:
         ref_pixel_values = ref_pixel_values.unsqueeze(1).unsqueeze(0) * 2 - 1.0
         ref_pixel_values = ref_pixel_values.to(dtype=self.vae.dtype, device=self.vae.device)
         if getattr(self, "use_vae_tiling", False):
-            ref_latents = tiled_encode(self.vae, ref_pixel_values[0], tile_px=getattr(self, "vae_tile_px", 128))
+            ref_latents = tiled_encode(self.vae, ref_pixel_values[0], tile_px=getattr(self, "vae_tile_px", 128)).unsqueeze(0)
         else:
             ref_latents = torch.stack(self.vae.encode(ref_pixel_values))
             
@@ -374,9 +375,9 @@ class WanS2V:
             motion_latents[:, :, -6:] = ref_pixel_values
 
         if getattr(self, "use_vae_tiling", False):
-            motion_latents = tiled_encode(self.vae, motion_latents[0], tile_px=getattr(self, "vae_tile_px", 128))
+            motion_latents = tiled_encode(self.vae, motion_latents[0], tile_px=getattr(self, "vae_tile_px", 128)).unsqueeze(0)
         else:
-            motion_latents = torch.stack(self.vae.encode(motion_latents))  
+            motion_latents = torch.stack(self.vae.encode(motion_latents))
                   
         encode_timer.stop()
 
@@ -546,7 +547,7 @@ class WanS2V:
                     
                 if getattr(self, "use_vae_tiling", False):
                     lt = pixel_to_latent_tiles(getattr(self, "vae_tile_px", 128))
-                    image = torch.stack([tiled_decode(self.vae, decode_latents, latent_tile=lt)])
+                    image = torch.stack([tiled_decode(self.vae, decode_latents[0], latent_tile=lt)])
                 else:
                     image = torch.stack(self.vae.decode(decode_latents))
                 image = image[:, :, -(infer_frames):]
@@ -564,8 +565,8 @@ class WanS2V:
                 ], dim=2)
                 videos_last_frames = videos_last_frames.to(
                     dtype=motion_latents.dtype, device=motion_latents.device)
-                if getattr(self, "use_vae_tiling", False):
-                    motion_latents = tiled_encode(self.vae, videos_last_frames[0], tile_px=getattr(self, "vae_tile_px", 128))
+               if getattr(self, "use_vae_tiling", False):
+                    motion_latents = tiled_encode(self.vae, videos_last_frames[0], tile_px=getattr(self, "vae_tile_px", 128)).unsqueeze(0)
                 else:
                     motion_latents = torch.stack(self.vae.encode(videos_last_frames))
                 

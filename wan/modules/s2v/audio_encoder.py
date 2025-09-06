@@ -59,34 +59,32 @@ class AudioEncoder():
         self.processor = Wav2Vec2Processor.from_pretrained(model_id)
         self.model = Wav2Vec2ForCTC.from_pretrained(model_id)
 
-        self.model = self.model.to(device)
+        self.model = self.model.to(device).eval()
+
 
         self.video_rate = 30
 
-    def extract_audio_feat(self,
-                           audio_path,
-                           return_all_layers=False,
-                           dtype=torch.float32):
+   def extract_audio_feat(self,
+                       audio_path,
+                       return_all_layers=False,
+                       dtype=torch.float32):
         audio_input, sample_rate = librosa.load(audio_path, sr=16000)
 
         input_values = self.processor(
-            audio_input, sampling_rate=sample_rate,
-            return_tensors="pt").input_values
+            audio_input,
+            sampling_rate=sample_rate,
+            return_tensors="pt"
+        ).input_values.to(self.model.device, non_blocking=True)
 
-        # INFERENCE
+        with torch.inference_mode():
+            res = self.model(input_values, output_hidden_states=True)
+            feat = torch.cat(res.hidden_states) if return_all_layers else res.hidden_states[-1]
+            feat = linear_interpolation(feat, input_fps=50, output_fps=self.video_rate)
 
-        # retrieve logits & take argmax
-        res = self.model(
-            input_values.to(self.model.device), output_hidden_states=True)
-        if return_all_layers:
-            feat = torch.cat(res.hidden_states)
-        else:
-            feat = res.hidden_states[-1]
-        feat = linear_interpolation(
-            feat, input_fps=50, output_fps=self.video_rate)
-
-        z = feat.to(dtype)  # Encoding for the motion
+        # keep features on GPU and in requested dtype
+        z = feat.to(device=self.model.device, dtype=dtype)
         return z
+
 
     def get_audio_embed_bucket(self,
                                audio_embed,

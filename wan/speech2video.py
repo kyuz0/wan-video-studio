@@ -114,6 +114,7 @@ class WanS2V:
 
         logging.info("Loading audio encoder...")
         self.audio_encoder = AudioEncoder(
+            device=self.device,  # force GPU
             model_id=os.path.join(checkpoint_dir,
                                   "wav2vec2-large-xlsr-53-english"))
         logging.info("Audio encoder loaded successfully")

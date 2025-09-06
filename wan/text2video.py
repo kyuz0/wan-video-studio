@@ -28,6 +28,7 @@ from .utils.fm_solvers import (
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.fm_solvers_euler import EulerScheduler
 from .utils.utils import model_safe_downcast, load_and_merge_lora_weight_from_safetensors, use_cfg, SimpleTimer
+from .utils.vae_tiling import tiled_decode, pixel_to_latent_tiles 
 
 class WanT2V:
 
@@ -404,7 +405,12 @@ class WanT2V:
             if self.rank == 0:
                 decode_timer = SimpleTimer("VAE decoding")
                 decode_timer.start()
-                videos = self.vae.decode(x0)
+
+                if getattr(self, "use_vae_tiling", False):
+                    lt = pixel_to_latent_tiles(getattr(self, "vae_tile_px", 128))
+                    videos = [tiled_decode(self.vae, x0[0], latent_tile=lt)]
+                else:
+                    videos = self.vae.decode(x0)
                 decode_timer.stop()
 
         del noise, latents

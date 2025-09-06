@@ -30,6 +30,7 @@ from .utils.fm_solvers import (
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.fm_solvers_euler import EulerScheduler
 from .utils.utils import model_safe_downcast, load_and_merge_lora_weight_from_safetensors, use_cfg, SimpleTimer
+from .utils.vae_tiling import tiled_encode, tiled_decode, pixel_to_latent_tiles  
 
 class WanI2V:
 
@@ -357,7 +358,10 @@ class WanI2V:
         # VAE encoding with timer
         encode_timer = SimpleTimer("VAE encoding")
         encode_timer.start()
-        y = self.vae.encode([video_tensor])[0]
+        if getattr(self, "use_vae_tiling", False):
+            y = tiled_encode(self.vae, video_tensor, tile_px=getattr(self, "vae_tile_px", 128))
+        else:
+            y = self.vae.encode([video_tensor])[0]
         encode_timer.stop()
         
         y = torch.concat([msk, y])
@@ -472,7 +476,11 @@ class WanI2V:
             if self.rank == 0:
                 decode_timer = SimpleTimer("VAE decoding")
                 decode_timer.start()
-                videos = self.vae.decode(x0)
+                if getattr(self, "use_vae_tiling", False):
+                    lt = pixel_to_latent_tiles(getattr(self, "vae_tile_px", 128))
+                    videos = [tiled_decode(self.vae, x0[0], latent_tile=lt)]
+                else:
+                    videos = self.vae.decode(x0)
                 decode_timer.stop()
 
         del noise, latent, x0

@@ -285,6 +285,11 @@ def _parse_args():
         help="Number of frames per clip, 48 or 80 or others (must be multiple of 4) for 14B s2v"
     )
 
+    parser.add_argument("--vae_tiling", action="store_true", default=True,
+                    help="Enable tiled WAN VAE encode/decode.")
+    parser.add_argument("--vae_tile_px", type=int, default=128,
+                    help="Tile size in pixels for VAE tiling.")
+
     args = parser.parse_args()
 
     _validate_args(args)
@@ -427,6 +432,9 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
+        if args.vae_tiling:
+            wan_t2v.use_vae_tiling = True
+            wan_t2v.vae_tile_px = args.vae_tile_px
 
         for i, prompt in enumerate(prompt_list):
             logging.info(f"Generating video ... index:{i} seed:{args.base_seed} prompt:{prompt}")
@@ -557,6 +565,9 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
+        if args.vae_tiling:
+            wan_i2v.use_vae_tiling = True
+            wan_i2v.vae_tile_px = args.vae_tile_px
 
         for i, (prompt, img) in enumerate(zip(prompt_list, image_list)):
             logging.info(f"Generating video ... index:{i} seed:{args.base_seed} prompt:{prompt}")

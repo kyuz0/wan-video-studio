@@ -64,7 +64,7 @@ class AudioEncoder():
 
         self.video_rate = 30
 
-   def extract_audio_feat(self,
+    def extract_audio_feat(self,
                        audio_path,
                        return_all_layers=False,
                        dtype=torch.float32):

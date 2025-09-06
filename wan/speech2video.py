@@ -441,26 +441,30 @@ class WanS2V:
                 max_seq_len = np.prod(target_shape) // 4
 
                 # Setup scheduler
-                if sample_solver == 'unipc':
+                
+                solver = (sample_solver or 'unipc').lower()
+                if solver == 'euler':
+                    solver = 'unipc'
+
+                if solver == 'unipc':
                     sample_scheduler = FlowUniPCMultistepScheduler(
                         num_train_timesteps=self.num_train_timesteps,
                         shift=1,
-                        use_dynamic_shifting=False)
-                    sample_scheduler.set_timesteps(
-                        sampling_steps, device=self.device, shift=shift)
+                        use_dynamic_shifting=False
+                    )
+                    sample_scheduler.set_timesteps(sampling_steps, device=self.device, shift=shift)
                     timesteps = sample_scheduler.timesteps
-                elif sample_solver == 'dpm++':
+                elif solver == 'dpm++':
                     sample_scheduler = FlowDPMSolverMultistepScheduler(
                         num_train_timesteps=self.num_train_timesteps,
                         shift=1,
-                        use_dynamic_shifting=False)
+                        use_dynamic_shifting=False
+                    )
                     sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
-                    timesteps, _ = retrieve_timesteps(
-                        sample_scheduler,
-                        device=self.device,
-                        sigmas=sampling_sigmas)
+                    timesteps, _ = retrieve_timesteps(sample_scheduler, device=self.device, sigmas=sampling_sigmas)
                 else:
                     raise NotImplementedError("Unsupported solver.")
+
 
                 latents = deepcopy(noise)
                 

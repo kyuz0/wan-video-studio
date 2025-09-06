@@ -327,11 +327,12 @@ class WanI2V:
 
         # preprocess
         logging.info("Encoding text prompts...")
+        
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
             context_null = self.text_encoder([n_prompt], self.device)
-            # Unload model from memory
+            # Unload text encoder to save memory
             del self.text_encoder
             torch.cuda.empty_cache()
             gc.collect()
@@ -340,7 +341,9 @@ class WanI2V:
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
-        logging.info("Text encoding completed")
+            # Unload text encoder
+            del self.text_encoder
+            gc.collect()
        
         # Prepare video tensor
         logging.info(f"Preparing video tensor: {F} frames at {h}x{w} resolution")

@@ -515,6 +515,10 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
+
+        if args.vae_tiling:
+            wan_s2v.use_vae_tiling = True
+            wan_s2v.vae_tile_px = args.vae_tile_px
         
         logging.info(f"Generating speech-driven video ...")
         video = wan_s2v.generate(

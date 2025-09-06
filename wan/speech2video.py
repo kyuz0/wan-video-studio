@@ -35,6 +35,7 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.utils import use_cfg, SimpleTimer
+from .utils.vae_tiling import tiled_encode, tiled_decode, pixel_to_latent_tiles
 
 
 def load_safetensors(path):
@@ -127,6 +128,8 @@ class WanS2V:
         self.drop_first_motion = config.drop_first_motion
         self.fps = config.sample_fps
         self.audio_sample_m = 0
+        self.use_vae_tiling = getattr(config, "use_vae_tiling", False)
+        self.vae_tile_px = int(getattr(config, "vae_tile_px", 128))
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -270,9 +273,12 @@ class WanS2V:
         for r in range(len(cond_tensors)):
             cond = cond_tensors[r]
             cond = torch.cat([cond[:, :, 0:1].repeat(1, 1, 1, 1, 1), cond], dim=2)
-            cond_lat = torch.stack(
-                self.vae.encode(
-                    cond.to(dtype=self.param_dtype, device=self.device)))[:, :, 1:].cpu()
+            _cond = cond.to(dtype=self.param_dtype, device=self.device)
+            if getattr(self, "use_vae_tiling", False):
+                _lat = tiled_encode(self.vae, _cond[0], tile_px=getattr(self, "vae_tile_px", 128))
+            else:
+                _lat = torch.stack(self.vae.encode(_cond))
+            cond_lat = _lat[:, :, 1:].cpu()
             COND.append(cond_lat)
             
         vae_timer.stop()
@@ -350,16 +356,23 @@ class WanS2V:
         ref_pixel_values = tensor_trans(model_pic)
         ref_pixel_values = ref_pixel_values.unsqueeze(1).unsqueeze(0) * 2 - 1.0
         ref_pixel_values = ref_pixel_values.to(dtype=self.vae.dtype, device=self.vae.device)
-        ref_latents = torch.stack(self.vae.encode(ref_pixel_values))
-
+        if getattr(self, "use_vae_tiling", False):
+            ref_latents = tiled_encode(self.vae, ref_pixel_values[0], tile_px=getattr(self, "vae_tile_px", 128))
+        else:
+            ref_latents = torch.stack(self.vae.encode(ref_pixel_values))
+            
         # Encode motion latents
         videos_last_frames = motion_latents.detach()
         drop_first_motion = self.drop_first_motion
         if init_first_frame:
             drop_first_motion = False
             motion_latents[:, :, -6:] = ref_pixel_values
-        motion_latents = torch.stack(self.vae.encode(motion_latents))
-        
+
+        if getattr(self, "use_vae_tiling", False):
+            motion_latents = tiled_encode(self.vae, motion_latents[0], tile_px=getattr(self, "vae_tile_px", 128))
+        else:
+            motion_latents = torch.stack(self.vae.encode(motion_latents))  
+                  
         encode_timer.stop()
 
         # Load pose conditions
@@ -522,8 +535,13 @@ class WanS2V:
                 else:
                     decode_latents = torch.cat([ref_latents, latents], dim=2)
                     
-                image = torch.stack(self.vae.decode(decode_latents))
+                if getattr(self, "use_vae_tiling", False):
+                    lt = pixel_to_latent_tiles(getattr(self, "vae_tile_px", 128))
+                    image = torch.stack([tiled_decode(self.vae, decode_latents, latent_tile=lt)])
+                else:
+                    image = torch.stack(self.vae.decode(decode_latents))
                 image = image[:, :, -(infer_frames):]
+
                 if (drop_first_motion and r == 0):
                     image = image[:, :, 3:]
 
@@ -537,7 +555,10 @@ class WanS2V:
                 ], dim=2)
                 videos_last_frames = videos_last_frames.to(
                     dtype=motion_latents.dtype, device=motion_latents.device)
-                motion_latents = torch.stack(self.vae.encode(videos_last_frames))
+                if getattr(self, "use_vae_tiling", False):
+                    motion_latents = tiled_encode(self.vae, videos_last_frames[0], tile_px=getattr(self, "vae_tile_px", 128))
+                else:
+                    motion_latents = torch.stack(self.vae.encode(videos_last_frames))
                 
                 out.append(image.cpu())
                 clip_timer.stop()

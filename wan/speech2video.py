@@ -565,7 +565,7 @@ class WanS2V:
                 ], dim=2)
                 videos_last_frames = videos_last_frames.to(
                     dtype=motion_latents.dtype, device=motion_latents.device)
-               if getattr(self, "use_vae_tiling", False):
+                if getattr(self, "use_vae_tiling", False):
                     motion_latents = tiled_encode(self.vae, videos_last_frames[0], tile_px=getattr(self, "vae_tile_px", 128)).unsqueeze(0)
                 else:
                     motion_latents = torch.stack(self.vae.encode(videos_last_frames))

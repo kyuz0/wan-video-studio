@@ -96,13 +96,17 @@ class WanS2V:
 
         logging.info(f"Loading S2V model from {checkpoint_dir}...")
         if not dit_fsdp:
+           self.noise_model = WanModel_S2V.from_pretrained(
+                checkpoint_dir,
+                torch_dtype=self.param_dtype,
+                low_cpu_mem_usage=False,   # avoid accelerate’s meta/sharded GPU copies on ROCm
+            )
+        else:
             self.noise_model = WanModel_S2V.from_pretrained(
                 checkpoint_dir,
                 torch_dtype=self.param_dtype,
-                device_map=self.device)
-        else:
-            self.noise_model = WanModel_S2V.from_pretrained(
-                checkpoint_dir, torch_dtype=self.param_dtype)
+                low_cpu_mem_usage=False,   # avoid accelerate’s meta/sharded GPU copies on ROCm
+            )
         logging.info("S2V model loaded successfully")
 
         self.noise_model = self._configure_model(

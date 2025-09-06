@@ -14,6 +14,8 @@ import threading
 import time
 import sys
 from tqdm import tqdm
+import subprocess
+import shutil
 
 __all__ = ['save_video', 'save_image', 'str2bool', "use_cfg", "model_safe_downcast", "load_and_merge_lora_weight_from_safetensors"]
 
@@ -331,3 +333,69 @@ def best_output_size(w, h, dw, dh, expected_area):
         return ow1, oh1
     else:
         return ow2, oh2
+
+def merge_video_audio(video_path: str, audio_path: str):
+    """
+    Merge the video and audio into a new video, with the duration set to the shorter of the two,
+    and overwrite the original video file.
+
+    Parameters:
+    video_path (str): Path to the original video file
+    audio_path (str): Path to the audio file
+    """
+    logging.info("Merging video and audio...")
+    merge_timer = SimpleTimer("Audio-video merge")
+    merge_timer.start()
+
+    # check
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"video file {video_path} does not exist")
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"audio file {audio_path} does not exist")
+
+    base, ext = os.path.splitext(video_path)
+    temp_output = f"{base}_temp{ext}"
+
+    try:
+        # create ffmpeg command
+        command = [
+            'ffmpeg',
+            '-y',  # overwrite
+            '-i',
+            video_path,
+            '-i',
+            audio_path,
+            '-c:v',
+            'copy',  # copy video stream
+            '-c:a',
+            'aac',  # use AAC audio encoder
+            '-b:a',
+            '192k',  # set audio bitrate (optional)
+            '-map',
+            '0:v:0',  # select the first video stream
+            '-map',
+            '1:a:0',  # select the first audio stream
+            '-shortest',  # choose the shortest duration
+            temp_output
+        ]
+
+        # execute the command
+        result = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        # check result
+        if result.returncode != 0:
+            error_msg = f"FFmpeg execute failed: {result.stderr}"
+            logging.error(error_msg)
+            raise RuntimeError(error_msg)
+
+        shutil.move(temp_output, video_path)
+        merge_timer.stop()
+        logging.info(f"Audio-video merge completed, saved to {video_path}")
+
+    except Exception as e:
+        if os.path.exists(temp_output):
+            os.remove(temp_output)
+        merge_timer.stop()
+        logging.error(f"merge_video_audio failed with error: {e}")
+        raise

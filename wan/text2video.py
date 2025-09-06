@@ -28,6 +28,7 @@ from .utils.fm_solvers import (
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.fm_solvers_euler import EulerScheduler
 from .utils.utils import model_safe_downcast, load_and_merge_lora_weight_from_safetensors, use_cfg, SimpleTimer
+from .utils.vae_tiling import tiled_decode, pixel_to_latent_tiles 
 
 class WanT2V:
 
@@ -287,20 +288,34 @@ class WanT2V:
         seed_g.manual_seed(seed)
 
         logging.info("Encoding text prompts...")
-        if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
-            # Unload model from memory
+
+        # keep only ONE diffusion model on GPU while calling T5 (mimic S2V)
+        _restore_high = False
+        if not self.t5_cpu and not offload_model:
+            hm = getattr(self, "high_noise_model", None)
+            if hm is not None and any(p.is_cuda for p in hm.parameters()):
+                hm.cpu()
+                _restore_high = True
+            torch.cuda.empty_cache()
+
+        try:
+            if not self.t5_cpu:
+                self.text_encoder.model.to(self.device).eval()
+                with torch.inference_mode():
+                    context = self.text_encoder([input_prompt], self.device)
+                    context_null = self.text_encoder([n_prompt], self.device)
+            else:
+                context = self.text_encoder([input_prompt], torch.device('cpu'))
+                context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+                context = [t.to(self.device) for t in context]
+                context_null = [t.to(self.device) for t in context_null]
+        finally:
+            if _restore_high:
+                hm.to(self.device)
             del self.text_encoder
             torch.cuda.empty_cache()
             gc.collect()
-        else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
-        logging.info("Text encoding completed")
+        
 
         noise = [
             torch.randn(
@@ -404,7 +419,12 @@ class WanT2V:
             if self.rank == 0:
                 decode_timer = SimpleTimer("VAE decoding")
                 decode_timer.start()
-                videos = self.vae.decode(x0)
+
+                if getattr(self, "use_vae_tiling", False):
+                    lt = pixel_to_latent_tiles(getattr(self, "vae_tile_px", 128))
+                    videos = [tiled_decode(self.vae, x0[0], latent_tile=lt)]
+                else:
+                    videos = self.vae.decode(x0)
                 decode_timer.stop()
 
         del noise, latents

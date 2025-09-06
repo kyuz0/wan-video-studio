@@ -21,6 +21,7 @@ from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CON
 from wan.distributed.util import init_distributed_group
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import save_video, str2bool
+from wan.utils.utils import merge_video_audio 
 
 EXAMPLE_PROMPT = {
     "t2v-A14B": {
@@ -36,6 +37,14 @@ EXAMPLE_PROMPT = {
     "ti2v-5B": {
         "prompt":
             "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage.",
+    },
+    "s2v-14B": {
+        "prompt":
+            "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside.",
+        "image":
+            "examples/i2v_input.JPG",
+        "audio":
+            "examples/talk.wav",
     },
 }
 
@@ -71,9 +80,17 @@ def _validate_args(args):
         args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
     if args.image is None and "image" in EXAMPLE_PROMPT[args.task]:
         args.image = EXAMPLE_PROMPT[args.task]["image"]
+    # Add audio validation for s2v
+    if args.audio is None and "audio" in EXAMPLE_PROMPT[args.task]:
+        args.audio = EXAMPLE_PROMPT[args.task]["audio"]
 
     if args.task == "i2v-A14B":
         assert args.image is not None or args.image_path_file is not None, "Please specify the image path for i2v."
+    
+    # Add s2v specific validation
+    if args.task == "s2v-14B":
+        assert args.image is not None, "Please specify the image path for s2v."
+        assert args.audio is not None, "Please specify the audio path for s2v."
 
     cfg = WAN_CONFIGS[args.task]
 
@@ -94,11 +111,11 @@ def _validate_args(args):
 
     args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(
         0, sys.maxsize)
-    # Size check
-    assert args.size in SUPPORTED_SIZES[
-        args.
-        task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
-
+    
+    # Size check - modify to exclude s2v from size validation
+    if 's2v' not in args.task:
+        assert args.size in SUPPORTED_SIZES[
+            args.task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
 
 def _parse_args():
     parser = argparse.ArgumentParser(
@@ -239,6 +256,39 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Whether to convert model paramerters dtype.")
+    parser.add_argument(
+        "--num_clip",
+        type=int,
+        default=None,
+        help="Number of video clips to generate, the whole video will not exceed the length of audio."
+    )
+    parser.add_argument(
+        "--audio",
+        type=str,
+        default=None,
+        help="Path to the audio file, e.g. wav, mp3")
+    parser.add_argument(
+        "--pose_video",
+        type=str,
+        default=None,
+        help="Provide Dw-pose sequence to do Pose Driven")
+    parser.add_argument(
+        "--start_from_ref",
+        action="store_true",
+        default=False,
+        help="whether set the reference image as the starting point for generation"
+    )
+    parser.add_argument(
+        "--infer_frames",
+        type=int,
+        default=80,
+        help="Number of frames per clip, 48 or 80 or others (must be multiple of 4) for 14B s2v"
+    )
+
+    parser.add_argument("--vae_tiling", action="store_true", default=True,
+                    help="Enable tiled WAN VAE encode/decode.")
+    parser.add_argument("--vae_tile_px", type=int, default=128,
+                    help="Tile size in pixels for VAE tiling.")
 
     args = parser.parse_args()
 
@@ -382,6 +432,9 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
+        if args.vae_tiling:
+            wan_t2v.use_vae_tiling = True
+            wan_t2v.vae_tile_px = args.vae_tile_px
 
         for i, prompt in enumerate(prompt_list):
             logging.info(f"Generating video ... index:{i} seed:{args.base_seed} prompt:{prompt}")
@@ -449,7 +502,59 @@ def generate(args):
                     save_file=args.save_file
                 )
             del video
+    elif "s2v" in args.task:  # Add this new case
+        logging.info("Creating WanS2V pipeline.")
+        wan_s2v = wan.WanS2V(
+            config=cfg,
+            checkpoint_dir=args.ckpt_dir,
+            device_id=device,
+            rank=rank,
+            t5_fsdp=args.t5_fsdp,
+            dit_fsdp=args.dit_fsdp,
+            use_sp=(args.ulysses_size > 1),
+            t5_cpu=args.t5_cpu,
+            convert_model_dtype=args.convert_model_dtype,
+        )
 
+        if args.vae_tiling:
+            wan_s2v.use_vae_tiling = True
+            wan_s2v.vae_tile_px = args.vae_tile_px
+        
+        logging.info(f"Generating speech-driven video ...")
+        video = wan_s2v.generate(
+            input_prompt=args.prompt,
+            ref_image_path=args.image,
+            audio_path=args.audio,
+            num_repeat=args.num_clip,
+            pose_video=args.pose_video,
+            max_area=MAX_AREA_CONFIGS[args.size],
+            infer_frames=args.infer_frames,
+            shift=args.sample_shift,
+            sample_solver=args.sample_solver,
+            sampling_steps=args.sample_steps,
+            guide_scale=args.sample_guide_scale,
+            seed=args.base_seed,
+            offload_model=args.offload_model,
+            init_first_frame=args.start_from_ref,
+        )
+
+        if rank == 0:
+            if args.save_file is None:
+                formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+                formatted_prompt = args.prompt.replace(" ", "_").replace("/", "_")[:50]
+                suffix = '.mp4'
+                args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{formatted_prompt}_{formatted_time}" + suffix
+
+            logging.info(f"Saving generated video to {args.save_file}")
+            save_video(
+                tensor=video[None],
+                save_file=args.save_file,
+                fps=cfg.sample_fps,
+                nrow=1,
+                normalize=True,
+                value_range=(-1, 1))
+            merge_video_audio(video_path=args.save_file, audio_path=args.audio)
+            del video
     else:
         logging.info("Creating WanI2V pipeline.")
         wan_i2v = wan.WanI2V(
@@ -464,6 +569,9 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
+        if args.vae_tiling:
+            wan_i2v.use_vae_tiling = True
+            wan_i2v.vae_tile_px = args.vae_tile_px
 
         for i, (prompt, img) in enumerate(zip(prompt_list, image_list)):
             logging.info(f"Generating video ... index:{i} seed:{args.base_seed} prompt:{prompt}")
@@ -489,7 +597,6 @@ def generate(args):
                     fps=cfg.sample_fps,
                     save_file=args.save_file
                 )
-            del video
 
     torch.cuda.synchronize()
     if dist.is_initialized():
@@ -502,10 +609,8 @@ def generate(args):
     if rank == 0:
         logging.info(f"=== COMPLETE SCRIPT EXECUTION ===")
         logging.info(f"Total script runtime: {timedelta(seconds=int(script_duration))}")
-    
 
     logging.info("Finished.")
-
 
 if __name__ == "__main__":
     args = _parse_args()

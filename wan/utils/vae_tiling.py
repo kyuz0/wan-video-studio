@@ -13,6 +13,8 @@ STRIDE_W = 8
 
 __all__ = ["tiled_encode", "tiled_decode", "pixel_to_latent_tiles"]
 
+# --------------------------- helpers ---------------------------
+
 def pixel_to_latent_tiles(tile_px: int) -> int:
     return max(1, int(tile_px) // STRIDE_H)
 
@@ -49,59 +51,143 @@ def _supports_direct_model_api(vae) -> bool:
     return hasattr(vae, "model") and hasattr(vae, "scale") and callable(getattr(vae.model, "encode", None)) and callable(getattr(vae.model, "decode", None))
 
 def _autocast_ctx(vae):
-    if vae is not None and hasattr(vae, "device") and torch.device(vae.device).type == "cuda":
-        return amp.autocast(device_type="cuda", dtype=getattr(vae, "dtype", torch.float16))
+    try:
+        if vae is not None and hasattr(vae, "device") and torch.device(vae.device).type == "cuda":
+            return amp.autocast(device_type="cuda", dtype=getattr(vae, "dtype", torch.float16))
+    except Exception:
+        pass
     return contextlib.nullcontext()
+
+# --------------------------- batched encode/decode ---------------------------
 
 @torch.no_grad()
 def _encode_many(vae, tiles, use_batch: bool, max_bs: int):
     if not tiles:
         return []
-    # If we can't batch, fall back to list API (safe for mixed sizes)
+    # Safe fallback: list API (handles mixed sizes)
     if not (use_batch and _supports_direct_model_api(vae)):
-        return vae.encode(tiles)  # list in -> list out  :contentReference[oaicite:0]{index=0}
-    # Bucket by size so we only stack equal shapes
+        return vae.encode(tiles)  # list[Tensor] -> list[Tensor]
+
+    # Bucket by (T,H,W) so stacks have equal shapes
     outs = [None] * len(tiles)
     buckets = {}
     for i, t in enumerate(tiles):
-        key = (t.shape[1], t.shape[2], t.shape[3])  # (T,H,W)
+        key = (t.shape[1], t.shape[2], t.shape[3])
         buckets.setdefault(key, []).append(i)
+
     with _autocast_ctx(vae):
-        for key, idxs in buckets.items():
+        for _, idxs in buckets.items():
             for s in range(0, len(idxs), max_bs):
                 batch_idx = idxs[s:s+max_bs]
                 x = torch.stack([tiles[j] for j in batch_idx], 0)  # [B,C,T,H,W]
-                z = vae.model.encode(x, vae.scale).float()  # [B,Cz,Tl,Hl,Wl]  :contentReference[oaicite:1]{index=1}
+                z = vae.model.encode(x, vae.scale).float()        # [B,Cz,Tl,Hl,Wl]
                 for k, j in enumerate(batch_idx):
                     outs[j] = z[k]
     return outs
-
-# --- keep the rest of the file as-is above this line ---
 
 @torch.no_grad()
 def _decode_many(vae, zs, use_batch: bool, max_bs: int):
     if not zs:
         return []
-    # Safe fallback for mixed shapes
+    # Safe fallback: list API (handles mixed sizes)
     if not (use_batch and _supports_direct_model_api(vae)):
-        return vae.decode(zs)
+        return vae.decode(zs)  # list[Tensor] -> list[Tensor]
 
+    # Bucket by (Tl,Hl,Wl) so stacks have equal shapes
     outs = [None] * len(zs)
     buckets = {}
     for i, z in enumerate(zs):
-        # z is [Cz, Tl, Hl, Wl]
-        key = (z.shape[-3], z.shape[-2], z.shape[-1])  # (Tl, Hl, Wl)
+        # z is [Cz, Tl, Hl, Wl] OR sometimes [Cz, Tl, Hl, Wl] as 4D; negative indices are safe
+        key = (z.shape[-3], z.shape[-2], z.shape[-1])
         buckets.setdefault(key, []).append(i)
 
     with _autocast_ctx(vae):
-        for key, idxs in buckets.items():
+        for _, idxs in buckets.items():
             for s in range(0, len(idxs), max_bs):
                 batch_idx = idxs[s:s+max_bs]
-                z = torch.stack([zs[j] for j in batch_idx], 0)  # [B,Cz,Tl,Hl,Wl]
+                z = torch.stack([zs[j] for j in batch_idx], 0)    # [B,Cz,Tl,Hl,Wl]
                 x = vae.model.decode(z, vae.scale).float().clamp_(-1, 1)  # [B,3,T,H,W]
                 for k, j in enumerate(batch_idx):
                     outs[j] = x[k]
     return outs
+
+# --------------------------- tiled encode/decode ---------------------------
+
+@torch.no_grad()
+def tiled_encode(
+    vae,
+    video: torch.Tensor,
+    tile_px: int = 256,
+    overlap_px: int = 64,
+    batch_tiles: int = 8,
+    use_batch: bool = True
+) -> torch.Tensor:
+    """
+    [3,T,H,W] or [1,3,T,H,W] -> latent [Cz,Tl,HL,WL]
+    Overlap + feathered blending (latent) with micro-batched encode.
+    """
+    if video.ndim == 5:
+        video = video[0]
+    assert video.ndim == 4 and video.shape[0] in (3, 4)
+    C, T, H, W = video.shape
+
+    th = tw = int(tile_px)
+    oy = ox = int(overlap_px)
+    th = max(th, STRIDE_H); tw = max(tw, STRIDE_W)
+    oy = (oy // STRIDE_H) * STRIDE_H
+    ox = (ox // STRIDE_W) * STRIDE_W
+
+    out = None
+    wsum = None
+
+    for y0 in range(0, H, th):
+        y_src0 = max(0, y0 - oy)
+        h_pix = min(th + (oy if y0 > 0 else 0) + (oy if y0 + th < H else 0), H - y_src0)
+
+        pending_tiles, pending_meta = [], []
+
+        for x0 in range(0, W, tw):
+            x_src0 = max(0, x0 - ox)
+            w_pix = min(tw + (ox if x0 > 0 else 0) + (ox if x0 + tw < W else 0), W - x_src0)
+
+            tile = video[:, :, y_src0:y_src0 + h_pix, x_src0:x_src0 + w_pix].contiguous()
+            tile = _pad_to_stride(tile, STRIDE_H, STRIDE_W, mode="reflect")
+            pending_tiles.append(tile)
+            pending_meta.append((y0, x0, y_src0, x_src0))
+
+            if len(pending_tiles) == batch_tiles or x0 + tw >= W:
+                z_list = _encode_many(vae, pending_tiles, use_batch, batch_tiles)
+
+                for z_tile, (y0i, x0i, ys0, xs0) in zip(z_list, pending_meta):
+                    h_core = min(th, H - y0i)
+                    w_core = min(tw, W - x0i)
+                    hL_core = math.ceil(h_core / STRIDE_H)
+                    wL_core = math.ceil(w_core / STRIDE_W)
+                    topL = (y0i - ys0) // STRIDE_H
+                    leftL = (x0i - xs0) // STRIDE_W
+                    z_core = z_tile[:, :, topL:topL + hL_core, leftL:leftL + wL_core]
+
+                    if out is None:
+                        Cz, Tl = z_tile.shape[:2]
+                        HL_full = math.ceil(H / STRIDE_H)
+                        WL_full = math.ceil(W / STRIDE_W)
+                        out = torch.zeros((Cz, Tl, HL_full, WL_full), device=video.device, dtype=z_tile.dtype)
+                        wsum = torch.zeros_like(out)
+
+                    yL0 = y0i // STRIDE_H
+                    xL0 = x0i // STRIDE_W
+                    oyL = max(1, oy // STRIDE_H) if y0i > 0 else 0
+                    oxL = max(1, ox // STRIDE_W) if x0i > 0 else 0
+                    m = _build_mask(hL_core, wL_core, oyL if y0i > 0 else 0, oxL if x0i > 0 else 0, z_core)
+
+                    out[:, :, yL0:yL0 + hL_core, xL0:xL0 + wL_core] += z_core * m
+                    wsum[:, :, yL0:yL0 + hL_core, xL0:xL0 + wL_core] += m
+
+                pending_tiles.clear()
+                pending_meta.clear()
+
+    out = out / wsum.clamp_min(1e-8)
+    return out
 
 @torch.no_grad()
 def tiled_decode(
@@ -112,12 +198,15 @@ def tiled_decode(
     batch_tiles: int = 8,
     use_batch: bool = True
 ) -> torch.Tensor:
-    # latent [Cz,Tl,HL,WL] -> video [3,T,H,W]
+    """
+    latent [Cz,Tl,HL,WL] -> video [3,T,H,W]
+    Overlap + feathered blending (pixel) with micro-batched decode.
+    """
     Cz, Tl, HL, WL = latent.shape
     step = max(1, int(latent_tile))
-    ov  = max(0, int(latent_overlap))
+    ov = max(0, int(latent_overlap))
 
-    # Probe once to infer per-latent pixel scale robustly
+    # Probe once via list API to get pixel scale safely
     y1 = min(step, HL); x1 = min(step, WL)
     probe = _decode_many(vae, [latent[:, :, :y1, :x1].contiguous()], use_batch=False, max_bs=1)[0]
     C, Tpix, hp, wp = probe.shape
@@ -126,7 +215,7 @@ def tiled_decode(
     H = HL * per_lat_h_probe
     W = WL * per_lat_w_probe
 
-    out  = torch.zeros((C, Tpix, H, W), device=latent.device, dtype=probe.dtype)
+    out = torch.zeros((C, Tpix, H, W), device=latent.device, dtype=probe.dtype)
     wsum = torch.zeros_like(out)
 
     pending_chunks, pending_meta = [], []
@@ -146,7 +235,7 @@ def tiled_decode(
 
                 for tile, (yb0i, yb1i, xb0i, xb1i) in zip(tiles, pending_meta):
                     th, tw = tile.shape[-2], tile.shape[-1]
-                    # Compute per-chunk pixel scale (handles edge tiles cleanly)
+                    # Per-chunk pixel scale (handles edges)
                     per_lat_h = max(1, th // (yb1i - yb0i))
                     per_lat_w = max(1, tw // (xb1i - xb0i))
 

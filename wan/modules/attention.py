@@ -1,7 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
+import os, sys, logging, warnings
 
-import os, sys, logging
 print(f"[wan.attn] loaded from {__file__}")
 logger = logging.getLogger("wan.attn")
 logger.propagate = False
@@ -11,8 +11,10 @@ if not logger.handlers:
     logger.addHandler(h)
 logger.setLevel(getattr(logging, os.getenv("WAN_LOGLEVEL", "INFO").upper(), logging.INFO))
 
-logger.info(f"[wan.attn] FA2={FLASH_ATTN_2_AVAILABLE} FA3={FLASH_ATTN_3_AVAILABLE} WAN_ATTENTION_BACKEND={os.getenv('WAN_ATTENTION_BACKEND','') or '(auto)'}")
+# env: WAN_ATTENTION_BACKEND in {"sdpa","sdpa_math","fa2","fa3",""}  ("" = auto)
+_WAN_ATTN = os.environ.get("WAN_ATTENTION_BACKEND", "").lower()
 
+# --- detect FlashAttention availability ---
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
@@ -25,12 +27,10 @@ try:
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
-import warnings
+logger.info(f"[wan.attn] FA2={FLASH_ATTN_2_AVAILABLE} FA3={FLASH_ATTN_3_AVAILABLE} "
+            f"WAN_ATTENTION_BACKEND={os.getenv('WAN_ATTENTION_BACKEND','') or '(auto)'}")
 
-__all__ = [
-    'flash_attention',
-    'attention',
-]
+__all__ = ["flash_attention", "attention"]
 
 
 def flash_attention(

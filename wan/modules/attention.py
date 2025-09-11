@@ -1,6 +1,21 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
 
+import os, logging
+logging.basicConfig(level=os.environ.get("WAN_LOGLEVEL", "INFO"))
+
+# env: WAN_ATTENTION_BACKEND in {"sdpa","sdpa_math","fa2","fa3",""}  ("" = auto)
+_WAN_ATTN = os.environ.get("WAN_ATTENTION_BACKEND", "").lower()
+
+def _which_backend(has_fa2: bool, has_fa3: bool):
+    if _WAN_ATTN in ("sdpa", "sdpa_math"): return "sdpa"
+    if _WAN_ATTN == "fa3" and has_fa3:    return "fa3"
+    if _WAN_ATTN == "fa2" and has_fa2:    return "fa2"
+    # auto: prefer fa3 > fa2 if available, else sdpa
+    if has_fa3: return "fa3"
+    if has_fa2: return "fa2"
+    return "sdpa"
+
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
@@ -131,49 +146,70 @@ def flash_attention(
 
 
 def attention(
-    q,
-    k,
-    v,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     q_lens=None,
     k_lens=None,
-    dropout_p=0.,
-    softmax_scale=None,
-    q_scale=None,
-    causal=False,
-    window_size=(-1, -1),
-    deterministic=False,
-    dtype=torch.bfloat16,
-    fa_version=None,
+    causal: bool = False,
+    window_size=None,
+    dtype=None,
+    dropout_p: float = 0.0,
+    fa_version: int | None = None,
 ):
-    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
-        return flash_attention(
-            q=q,
-            k=k,
-            v=v,
-            q_lens=q_lens,
-            k_lens=k_lens,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            q_scale=q_scale,
-            causal=causal,
-            window_size=window_size,
-            deterministic=deterministic,
-            dtype=dtype,
-            version=fa_version,
-        )
-    else:
-        if q_lens is not None or k_lens is not None:
-            warnings.warn(
-                'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
+    import os, logging
+    logging.basicConfig(level=os.environ.get("WAN_LOGLEVEL", "INFO"))
+    forced = os.environ.get("WAN_ATTENTION_BACKEND", "").lower()
+
+    def _choose_backend(has_fa2: bool, has_fa3: bool) -> str:
+        if forced in ("sdpa", "sdpa_math"): return "sdpa"
+        if forced == "fa3" and has_fa3:    return "fa3"
+        if forced == "fa2" and has_fa2:    return "fa2"
+        if fa_version == 3 and has_fa3:    return "fa3"
+        if fa_version == 2 and has_fa2:    return "fa2"
+        if has_fa3: return "fa3"
+        if has_fa2: return "fa2"
+        return "sdpa"
+
+    backend = _choose_backend(FLASH_ATTN_2_AVAILABLE, FLASH_ATTN_3_AVAILABLE)
+    logging.info(
+        f"[wan.attn] backend={backend} "
+        f"q{tuple(q.shape)} k{tuple(k.shape)} v{tuple(v.shape)} "
+        f"causal={causal} win={window_size} dtype={q.dtype}"
+    )
+
+    # ---- FlashAttention path ----
+    if backend.startswith("fa"):
+        ver = 3 if (backend == "fa3" and FLASH_ATTN_3_AVAILABLE) else 2
+        if fa_version in (2, 3):  # explicit override from caller
+            ver = fa_version
+        logging.debug(f"[wan.attn.fa] v{ver} launching")
+        try:
+            return flash_attention(
+                q=q, k=k, v=v,
+                q_lens=q_lens, k_lens=k_lens,
+                causal=causal, window_size=window_size,
+                dtype=dtype, version=ver, dropout_p=dropout_p
             )
-        attn_mask = None
+        except Exception as e:
+            logging.error(f"[wan.attn.fa] CRASH v{ver}: {e}")
+            # re-raise so you see the exact failing call in logs
+            raise
 
-        q = q.transpose(1, 2).to(dtype)
-        k = k.transpose(1, 2).to(dtype)
-        v = v.transpose(1, 2).to(dtype)
-
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
-
-        out = out.transpose(1, 2).contiguous()
-        return out
+    # ---- SDPA path ----
+    # Optional: respect sdpa_math (force math kernels) via torch backend switch set in generate.py
+    logging.debug("[wan.attn.sdpa] launching")
+    if q_lens is not None or k_lens is not None:
+        warnings.warn(
+            'Padding mask is disabled when using scaled_dot_product_attention. '
+            'It can impact performance.'
+        )
+    # SDPA expects (B, H, L, D)
+    q_ = q.transpose(1, 2).to(dtype)
+    k_ = k.transpose(1, 2).to(dtype)
+    v_ = v.transpose(1, 2).to(dtype)
+    attn_mask = None
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q_, k_, v_, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p
+    )
+    return out.transpose(1, 2).contiguous()

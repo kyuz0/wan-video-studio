@@ -61,6 +61,29 @@ def flash_attention(
     deterministic:  bool. If True, slightly slower and uses more memory.
     dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
     """
+
+    logger.info(f"[wan.attn] backend=fa3" if ((version is None or version == 3) and FLASH_ATTN_3_AVAILABLE)
+                else "[wan.attn] backend=fa2")
+    
+    # --- ENV OVERRIDE: route to PyTorch SDPA instead of FlashAttention ---
+    forced = os.environ.get("WAN_ATTENTION_BACKEND", "").lower()
+    if forced in ("sdpa", "sdpa_math"):
+        out_dtype = q.dtype
+        # honor requested compute dtype if provided
+        if dtype is not None:
+            q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+        logger.info(f"[wan.attn] backend=sdpa (shim) "
+                    f"q{tuple(q.shape)} k{tuple(k.shape)} v{tuple(v.shape)} "
+                    f"causal={causal} win={window_size} dtype={q.dtype}")
+        # SDPA expects (B, H, L, D)
+        q_, k_, v_ = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q_, k_, v_, attn_mask=None, is_causal=causal, dropout_p=dropout_p
+        ).transpose(1, 2).contiguous()
+        return x.type(out_dtype)
+    # ---------------------------------------------------------------------
+
+
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
     assert q.device.type == 'cuda' and q.size(-1) <= 256

@@ -2,29 +2,16 @@
 import torch
 
 import os, sys, logging
-print(f"[wan.attn] loaded from {__file__}")  # proves you’re using THIS file
-
-# force a dedicated logger that always prints
-_LVL = getattr(logging, os.getenv("WAN_LOGLEVEL", "INFO").upper(), logging.INFO)
+print(f"[wan.attn] loaded from {__file__}")
 logger = logging.getLogger("wan.attn")
 logger.propagate = False
-logger.setLevel(_LVL)
-_handler = logging.StreamHandler(sys.stderr)
-_handler.setLevel(_LVL)
-_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-logger.handlers[:] = [_handler]
+if not logger.handlers:
+    h = logging.StreamHandler(sys.stderr)
+    h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(h)
+logger.setLevel(getattr(logging, os.getenv("WAN_LOGLEVEL", "INFO").upper(), logging.INFO))
 
-# env: WAN_ATTENTION_BACKEND in {"sdpa","sdpa_math","fa2","fa3",""}  ("" = auto)
-_WAN_ATTN = os.environ.get("WAN_ATTENTION_BACKEND", "").lower()
-
-def _which_backend(has_fa2: bool, has_fa3: bool):
-    if _WAN_ATTN in ("sdpa", "sdpa_math"): return "sdpa"
-    if _WAN_ATTN == "fa3" and has_fa3:    return "fa3"
-    if _WAN_ATTN == "fa2" and has_fa2:    return "fa2"
-    # auto: prefer fa3 > fa2 if available, else sdpa
-    if has_fa3: return "fa3"
-    if has_fa2: return "fa2"
-    return "sdpa"
+logger.info(f"[wan.attn] FA2={FLASH_ATTN_2_AVAILABLE} FA3={FLASH_ATTN_3_AVAILABLE} WAN_ATTENTION_BACKEND={os.getenv('WAN_ATTENTION_BACKEND','') or '(auto)'}")
 
 try:
     import flash_attn_interface
@@ -168,6 +155,7 @@ def attention(
     fa_version: int | None = None,
 ):
     forced = os.environ.get("WAN_ATTENTION_BACKEND", "").lower()
+    fa_dtype = dtype or torch.bfloat16  # FA asserts half dtype; default safely
 
     def _choose_backend(has_fa2: bool, has_fa3: bool) -> str:
         if forced in ("sdpa", "sdpa_math"): return "sdpa"
@@ -196,7 +184,7 @@ def attention(
                 q=q, k=k, v=v,
                 q_lens=q_lens, k_lens=k_lens,
                 causal=causal, window_size=window_size,
-                dtype=dtype, version=ver, dropout_p=dropout_p
+                dtype=fa_dtype, version=ver, dropout_p=dropout_p
             )
         except Exception as e:
             logger.error(f"[wan.attn.fa] CRASH v{ver}: {e}")

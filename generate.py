@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 from PIL import Image
 
-import os, torch
+import os
 if os.environ.get("WAN_ATTENTION_BACKEND", "").lower() in ("sdpa", "sdpa_math"):
     from torch.backends.cuda import sdp_kernel
     if os.environ["WAN_ATTENTION_BACKEND"].lower() == "sdpa_math":

@@ -1,8 +1,18 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
 
-import os, logging
-logging.basicConfig(level=os.environ.get("WAN_LOGLEVEL", "INFO"))
+import os, sys, logging
+print(f"[wan.attn] loaded from {__file__}")  # proves you’re using THIS file
+
+# force a dedicated logger that always prints
+_LVL = getattr(logging, os.getenv("WAN_LOGLEVEL", "INFO").upper(), logging.INFO)
+logger = logging.getLogger("wan.attn")
+logger.propagate = False
+logger.setLevel(_LVL)
+_handler = logging.StreamHandler(sys.stderr)
+_handler.setLevel(_LVL)
+_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+logger.handlers[:] = [_handler]
 
 # env: WAN_ATTENTION_BACKEND in {"sdpa","sdpa_math","fa2","fa3",""}  ("" = auto)
 _WAN_ATTN = os.environ.get("WAN_ATTENTION_BACKEND", "").lower()
@@ -157,8 +167,6 @@ def attention(
     dropout_p: float = 0.0,
     fa_version: int | None = None,
 ):
-    import os, logging
-    logging.basicConfig(level=os.environ.get("WAN_LOGLEVEL", "INFO"))
     forced = os.environ.get("WAN_ATTENTION_BACKEND", "").lower()
 
     def _choose_backend(has_fa2: bool, has_fa3: bool) -> str:
@@ -172,18 +180,17 @@ def attention(
         return "sdpa"
 
     backend = _choose_backend(FLASH_ATTN_2_AVAILABLE, FLASH_ATTN_3_AVAILABLE)
-    logging.info(
+    logger.info(
         f"[wan.attn] backend={backend} "
         f"q{tuple(q.shape)} k{tuple(k.shape)} v{tuple(v.shape)} "
         f"causal={causal} win={window_size} dtype={q.dtype}"
     )
 
-    # ---- FlashAttention path ----
     if backend.startswith("fa"):
         ver = 3 if (backend == "fa3" and FLASH_ATTN_3_AVAILABLE) else 2
-        if fa_version in (2, 3):  # explicit override from caller
+        if fa_version in (2, 3):
             ver = fa_version
-        logging.debug(f"[wan.attn.fa] v{ver} launching")
+        logger.debug(f"[wan.attn.fa] v{ver} launching")
         try:
             return flash_attention(
                 q=q, k=k, v=v,
@@ -192,24 +199,19 @@ def attention(
                 dtype=dtype, version=ver, dropout_p=dropout_p
             )
         except Exception as e:
-            logging.error(f"[wan.attn.fa] CRASH v{ver}: {e}")
-            # re-raise so you see the exact failing call in logs
+            logger.error(f"[wan.attn.fa] CRASH v{ver}: {e}")
             raise
 
-    # ---- SDPA path ----
-    # Optional: respect sdpa_math (force math kernels) via torch backend switch set in generate.py
-    logging.debug("[wan.attn.sdpa] launching")
+    # SDPA path
+    logger.debug("[wan.attn.sdpa] launching")
     if q_lens is not None or k_lens is not None:
         warnings.warn(
-            'Padding mask is disabled when using scaled_dot_product_attention. '
-            'It can impact performance.'
+            'Padding mask is disabled when using scaled_dot_product_attention. It can impact performance.'
         )
-    # SDPA expects (B, H, L, D)
     q_ = q.transpose(1, 2).to(dtype)
     k_ = k.transpose(1, 2).to(dtype)
     v_ = v.transpose(1, 2).to(dtype)
-    attn_mask = None
     out = torch.nn.functional.scaled_dot_product_attention(
-        q_, k_, v_, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p
+        q_, k_, v_, attn_mask=None, is_causal=causal, dropout_p=dropout_p
     )
     return out.transpose(1, 2).contiguous()

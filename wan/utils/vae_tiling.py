@@ -1,8 +1,10 @@
 # wan/utils/vae_tiling.py
 import math
+import functools
 import torch
 import torch.nn.functional as F
 
+# WAN-2.1 VAE strides (time,height,width -> latent)
 STRIDE_T = 4
 STRIDE_H = 8
 STRIDE_W = 8
@@ -17,42 +19,90 @@ def _pad_to_stride(x: torch.Tensor, sh: int, sw: int, mode: str = "reflect") -> 
     ph = (math.ceil(H / sh) * sh) - H
     pw = (math.ceil(W / sw) * sw) - W
     if ph or pw:
-        # pad (left, right, top, bottom)
         x = F.pad(x, (0, pw, 0, ph), mode=mode)
     return x
 
-def _feather_mask(h: int, w: int, oy: int, ox: int, iy: int, ix: int, device, dtype):
-    """
-    Build a separable cosine ramp mask sized [1,1,h,w] where inner core [iy..h-iy, ix..w-ix] ≈ 1
-    and ramps down to edges over overlap size oy/ox. Used to blend tiles.
-    """
-    def ramp(n, o, i):
-        # n total, inner margin i, overlap o
-        v = torch.ones(n, device=device, dtype=dtype)
-        if o > 0:
-            # left ramp
-            if i > 0: v[:i] = 0.0
-            r = torch.arange(o, device=device, dtype=dtype)
-            v[i:i+o] = 0.5 - 0.5*torch.cos(math.pi*(r+1)/(o+1))
-            # right ramp
-            if i > 0: v[-i:] = 0.0
-            v[-(o+i):-i if i>0 else None] = v[i:i+o].flip(0)
-        else:
-            if i > 0:
-                v[:] = 0.0
-                v[i:-i] = 1.0
-        return v
-
-    wy = ramp(h, oy, iy)
-    wx = ramp(w, ox, ix)
+@functools.lru_cache(maxsize=128)
+def _feather_mask_cached(h: int, w: int, oy: int, ox: int, device_type: str, dtype_str: str):
+    device = torch.device(device_type)
+    dtype = getattr(torch, dtype_str)
+    def ramp(n, o):
+        if o <= 0:
+            return torch.ones(n, device=device, dtype=dtype)
+        r = torch.arange(n, device=device, dtype=dtype)
+        left  = torch.clamp((r / (o + 1)), 0, 1)
+        right = torch.clamp(((n - 1 - r) / (o + 1)), 0, 1)
+        edge  = torch.minimum(left, right)
+        # Cosine feather near edges; 1.0 center, ~0 at borders over 'o'
+        return 0.5 - 0.5*torch.cos(edge * math.pi)
+    wy = ramp(h, oy)
+    wx = ramp(w, ox)
     mask = wy.view(1,1,h,1) * wx.view(1,1,1,w)
     return mask
 
+def _build_mask(h, w, oy, ox, ref: torch.Tensor):
+    m = _feather_mask_cached(h, w, oy, ox, ref.device.type, str(ref.dtype).split('.')[-1])
+    # ensure on exact device (handles cuda:N)
+    if m.device != ref.device:
+        m = m.to(ref.device)
+    return m
+
+def _supports_batch_api(vae) -> bool:
+    # Prefer explicit encode_batch/decode_batch if present
+    if hasattr(vae, "encode_batch") and hasattr(vae, "decode_batch"):
+        return True
+    # Fallback: direct model call if available (Wan2_1_VAE has model.encode/decode)
+    return hasattr(vae, "model") and hasattr(vae, "scale") and callable(getattr(vae.model, "encode", None)) and callable(getattr(vae.model, "decode", None))
+
 @torch.no_grad()
-def tiled_encode(vae, video: torch.Tensor, tile_px: int = 128, overlap_px: int = 64) -> torch.Tensor:
+def _encode_many(vae, tiles, use_batch: bool, max_bs: int):
+    if not tiles:
+        return []
+    if use_batch and _supports_batch_api(vae):
+        outs = []
+        for i in range(0, len(tiles), max_bs):
+            chunk = tiles[i:i+max_bs]
+            if hasattr(vae, "encode_batch"):
+                z = vae.encode_batch(chunk)  # expects list[Tensor]->list[Tensor]
+            else:
+                x = torch.stack(chunk, dim=0)  # [B,C,T,H,W]
+                z = vae.model.encode(x, vae.scale).float()  # [B,Cz,Tl,Hl,Wl]
+                z = [z[j] for j in range(z.shape[0])]
+            outs.extend(z)
+        return outs
+    # fallback: serial
+    return vae.encode(tiles)
+
+@torch.no_grad()
+def _decode_many(vae, zs, use_batch: bool, max_bs: int):
+    if not zs:
+        return []
+    if use_batch and _supports_batch_api(vae):
+        outs = []
+        for i in range(0, len(zs), max_bs):
+            chunk = zs[i:i+max_bs]
+            if hasattr(vae, "decode_batch"):
+                x = vae.decode_batch(chunk)  # list[Tensor]->list[Tensor]
+            else:
+                z = torch.stack(chunk, dim=0)  # [B,Cz,Tl,Hl,Wl]
+                x = vae.model.decode(z, vae.scale).float().clamp_(-1, 1)  # [B,3,T,H,W]
+                x = [x[j] for j in range(x.shape[0])]
+            outs.extend(x)
+        return outs
+    return vae.decode(zs)
+
+@torch.no_grad()
+def tiled_encode(
+    vae,
+    video: torch.Tensor,
+    tile_px: int = 256,
+    overlap_px: int = 64,
+    batch_tiles: int = 8,            # NEW: micro-batching (default on)
+    use_batch: bool = True           # NEW: try batched VAE calls by default
+) -> torch.Tensor:
     """
     [3,T,H,W] or [1,3,T,H,W] -> latent [Cz,Tl,HL,WL]
-    Adds spatial overlap + feathered blending to avoid seams.
+    Overlap + feathered blending (in latent) with micro-batched encode calls.
     """
     if video.ndim == 5:
         video = video[0]
@@ -61,7 +111,6 @@ def tiled_encode(vae, video: torch.Tensor, tile_px: int = 128, overlap_px: int =
 
     th = tw = int(tile_px)
     oy = ox = int(overlap_px)
-    # enforce multiples of stride for core placement
     th = max(th, STRIDE_H); tw = max(tw, STRIDE_W)
     oy = (oy // STRIDE_H) * STRIDE_H
     ox = (ox // STRIDE_W) * STRIDE_W
@@ -69,77 +118,89 @@ def tiled_encode(vae, video: torch.Tensor, tile_px: int = 128, overlap_px: int =
     out = None
     wsum = None
 
+    # Collect tiles per row (reduces tiny batches)
     for y0 in range(0, H, th):
-        h_pix = min(th + (oy if y0>0 else 0) + (oy if y0+th < H else 0), H - max(0, y0-oy))
         y_src0 = max(0, y0 - oy)
+        h_pix = min(th + (oy if y0>0 else 0) + (oy if y0+th < H else 0), H - y_src0)
+
+        pending_tiles = []
+        pending_meta  = []
+
         for x0 in range(0, W, tw):
             x_src0 = max(0, x0 - ox)
             w_pix = min(tw + (ox if x0>0 else 0) + (ox if x0+tw < W else 0), W - x_src0)
 
             tile = video[:, :, y_src0:y_src0 + h_pix, x_src0:x_src0 + w_pix].contiguous()
             tile = _pad_to_stride(tile, STRIDE_H, STRIDE_W, mode="reflect")
-            z_tile = vae.encode([tile])[0]  # [Cz,Tl,hL_pad,wL_pad]
+            pending_tiles.append(tile)
+            pending_meta.append((y0, x0, y_src0, x_src0, h_pix, w_pix))
 
-            # compute valid (center) region in latent units to crop away halo
-            h_core = min(th, H - y0)
-            w_core = min(tw, W - x0)
-            hL_core = math.ceil(h_core / STRIDE_H)
-            wL_core = math.ceil(w_core / STRIDE_W)
+            if len(pending_tiles) == batch_tiles or x0 + tw >= W:
+                # encode these tiles together
+                z_list = _encode_many(vae, pending_tiles, use_batch, batch_tiles)
 
-            # total latent size of the encoded (haloed) tile
-            hL_tot = math.ceil(h_pix / STRIDE_H)
-            wL_tot = math.ceil(w_pix / STRIDE_W)
+                for z_tile, (y0i,x0i,ys0,xs0,hp,wp) in zip(z_list, pending_meta):
+                    h_core = min(th, H - y0i)
+                    w_core = min(tw, W - x0i)
+                    hL_core = math.ceil(h_core / STRIDE_H)
+                    wL_core = math.ceil(w_core / STRIDE_W)
 
-            # halo in latent cells
-            topL  = (y0 - y_src0) // STRIDE_H
-            leftL = (x0 - x_src0) // STRIDE_W
-            z_core = z_tile[:, :, topL:topL + hL_core, leftL:leftL + wL_core]
+                    topL  = (y0i - ys0) // STRIDE_H
+                    leftL = (x0i - xs0) // STRIDE_W
+                    z_core = z_tile[:, :, topL:topL + hL_core, leftL:leftL + wL_core]
 
-            if out is None:
-                Cz, Tl = z_tile.shape[:2]
-                HL_full = math.ceil(H / STRIDE_H)
-                WL_full = math.ceil(W / STRIDE_W)
-                out = torch.zeros((Cz, Tl, HL_full, WL_full),
-                                  device=video.device, dtype=z_tile.dtype)
-                wsum = torch.zeros_like(out)
+                    if out is None:
+                        Cz, Tl = z_tile.shape[:2]
+                        HL_full = math.ceil(H / STRIDE_H)
+                        WL_full = math.ceil(W / STRIDE_W)
+                        out  = torch.zeros((Cz, Tl, HL_full, WL_full), device=video.device, dtype=z_tile.dtype)
+                        wsum = torch.zeros_like(out)
 
-            yL0 = y0 // STRIDE_H
-            xL0 = x0 // STRIDE_W
+                    yL0 = y0i // STRIDE_H
+                    xL0 = x0i // STRIDE_W
 
-            # blend weights over core in latent space (use small latent feathering)
-            oyL = max(1, oy // STRIDE_H) if y0>0 else 0
-            oxL = max(1, ox // STRIDE_W) if x0>0 else 0
-            iyL = 0; ixL = 0  # inner “dead” band not needed in latent here
-            m = _feather_mask(hL_core, wL_core, oyL if y0>0 else 0, oxL if x0>0 else 0, iyL, ixL,
-                              device=video.device, dtype=z_core.dtype)
+                    oyL = max(1, oy // STRIDE_H) if y0i>0 else 0
+                    oxL = max(1, ox // STRIDE_W) if x0i>0 else 0
+                    m = _build_mask(hL_core, wL_core, oyL if y0i>0 else 0, oxL if x0i>0 else 0, z_core)
 
-            out[:, :, yL0:yL0 + hL_core, xL0:xL0 + wL_core] += z_core * m
-            wsum[:, :, yL0:yL0 + hL_core, xL0:xL0 + wL_core] += m
+                    out[:, :, yL0:yL0 + hL_core, xL0:xL0 + wL_core] += z_core * m
+                    wsum[:, :, yL0:yL0 + hL_core, xL0:xL0 + wL_core] += m
+
+                pending_tiles.clear()
+                pending_meta.clear()
 
     out = out / (wsum.clamp_min(1e-8))
     return out
 
 @torch.no_grad()
-def tiled_decode(vae, latent: torch.Tensor, latent_tile: int = 16, latent_overlap: int = 4) -> torch.Tensor:
+def tiled_decode(
+    vae,
+    latent: torch.Tensor,
+    latent_tile: int = 32,          # derived from tile_px=256, stride=8
+    latent_overlap: int = 8,        # derived from overlap_px=64, stride=8
+    batch_tiles: int = 8,           # NEW: micro-batching (default on)
+    use_batch: bool = True          # NEW: try batched VAE calls by default
+) -> torch.Tensor:
     """
     latent [Cz,Tl,HL,WL] -> video [3,T,H,W]
-    Decode in latent tiles with overlap and cosine blending in **pixel** space.
+    Overlap + feathered blending (in pixel) with micro-batched decode calls.
     """
     Cz, Tl, HL, WL = latent.shape
     step = max(1, int(latent_tile))
     ov  = max(0, int(latent_overlap))
 
-    # probe one tiny decode to get pixel scaling
-    y1 = min(step, HL); x1 = min(step, WL)
-    probe = vae.decode([latent[:, :, :y1, :x1]])[0]  # [3,T,hp,wp]
-    C, T, hp, wp = probe.shape
-    scale_h = hp / y1
-    scale_w = wp / x1
-    H = int(round(HL * scale_h))
-    W = int(round(WL * scale_w))
+    # Infer scale from strides only once
+    # Each latent cell corresponds to STRIDE_H/W pixels spatially
+    scale_h = STRIDE_H
+    scale_w = STRIDE_W
+    H = HL * scale_h
+    W = WL * scale_w
 
-    out  = torch.zeros((C, T, H, W), device=latent.device, dtype=probe.dtype)
+    out  = torch.zeros((3, Tl*STRIDE_T//STRIDE_T, H, W), device=latent.device, dtype=latent.dtype)
     wsum = torch.zeros_like(out)
+
+    pending_chunks = []
+    pending_meta   = []
 
     for y0 in range(0, HL, step):
         for x0 in range(0, WL, step):
@@ -147,22 +208,27 @@ def tiled_decode(vae, latent: torch.Tensor, latent_tile: int = 16, latent_overla
             xb0 = max(0, x0 - ov); xb1 = min(WL, x0 + step + ov)
 
             z = latent[:, :, yb0:yb1, xb0:xb1].contiguous()
-            tile = vae.decode([z])[0]  # [3,T,hp,wp]
+            pending_chunks.append(z)
+            pending_meta.append((yb0, xb0))
 
-            yp0 = int(round(yb0 * scale_h))
-            xp0 = int(round(xb0 * scale_w))
-            yp1 = yp0 + tile.shape[-2]
-            xp1 = xp0 + tile.shape[-1]
+            if len(pending_chunks) == batch_tiles or (x0 + step >= WL and y0 + step >= HL):
+                tiles = _decode_many(vae, pending_chunks, use_batch, batch_tiles)
 
-            # build feather mask in pixel space (blend on the borders)
-            oy = int(round(ov * scale_h))
-            ox = int(round(ov * scale_w))
-            # valid core relative to the block (exclude the halo from weight 1.0)
-            iy = 0; ix = 0
-            m = _feather_mask(tile.shape[-2], tile.shape[-1], oy, ox, iy, ix, device=tile.device, dtype=tile.dtype)
+                for tile, (yb0i, xb0i) in zip(tiles, pending_meta):
+                    yp0 = yb0i * scale_h
+                    xp0 = xb0i * scale_w
+                    yp1 = yp0 + tile.shape[-2]
+                    xp1 = xp0 + tile.shape[-1]
 
-            out[:, :, yp0:yp1, xp0:xp1] += tile * m
-            wsum[:, :, yp0:yp1, xp0:xp1] += m
+                    oy = ov * scale_h
+                    ox = ov * scale_w
+                    m = _build_mask(tile.shape[-2], tile.shape[-1], oy, ox, tile)
+
+                    out[:, :, yp0:yp1, xp0:xp1] += tile * m
+                    wsum[:, :, yp0:yp1, xp0:xp1] += m
+
+                pending_chunks.clear()
+                pending_meta.clear()
 
     out = out / wsum.clamp_min(1e-8)
     return out

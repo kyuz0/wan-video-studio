@@ -16,6 +16,14 @@ import torch
 import torch.distributed as dist
 from PIL import Image
 
+import os
+if os.environ.get("WAN_ATTENTION_BACKEND", "").lower() in ("sdpa", "sdpa_math"):
+    from torch.backends.cuda import sdp_kernel
+    if os.environ["WAN_ATTENTION_BACKEND"].lower() == "sdpa_math":
+        sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
+    else:
+        sdp_kernel(enable_flash=False, enable_mem_efficient=True, enable_math=False)
+
 import wan
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.distributed.util import init_distributed_group

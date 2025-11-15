@@ -1,25 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
-import os
-import sys
-import logging
 import torch
-
-# -----------------------------------------------------------------------------
-# Minimal, production logging: print exactly once which attention backend is used
-# -----------------------------------------------------------------------------
-logger = logging.getLogger("wan.attn")
-logger.propagate = False
-if not logger.handlers:
-    h = logging.StreamHandler(sys.stderr)
-    h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-    logger.addHandler(h)
-logger.setLevel(getattr(logging, os.getenv("WAN_LOGLEVEL", "INFO").upper(), logging.INFO))
-_LOGGED_BACKEND = False
-def _log_backend_once(label: str):
-    global _LOGGED_BACKEND
-    if not _LOGGED_BACKEND:
-        logger.info(f"Using attention backend: {label}")
-        _LOGGED_BACKEND = True
 
 __all__ = ["flash_attention", "attention"]
 
@@ -50,8 +30,6 @@ def flash_attention(
 
     if window_size != (-1, -1):
         raise NotImplementedError("window_size is not supported with torch SDPA")
-
-    _log_backend_once("Torch SDPA")
 
     out_dtype = q.dtype
     target_dtype = dtype or torch.bfloat16

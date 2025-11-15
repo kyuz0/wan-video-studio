@@ -1,18 +1,7 @@
 # wan/utils/vae_tiling.py
 import math
-from collections import defaultdict
-from contextlib import nullcontext
-
 import torch
 import torch.nn.functional as F
-
-try:
-    from torch.amp import autocast as torch_autocast
-except ImportError:  # fallback for older torch
-    try:
-        from torch.cuda.amp import autocast as torch_autocast  # type: ignore
-    except ImportError:
-        torch_autocast = None  # type: ignore
 
 # WAN-2.1 VAE strides (time,height,width -> latent)
 STRIDE_T = 4
@@ -32,43 +21,6 @@ def _pad_to_stride(x: torch.Tensor, sh: int, sw: int, mode: str = "reflect") -> 
         x = F.pad(x, (0, pw, 0, ph), mode=mode)
     return x
 
-# -------- helpers --------
-
-def _vae_autocast_context(device_type: str, dtype: torch.dtype):
-    if torch_autocast is None:
-        return nullcontext()
-    enabled = device_type in {"cuda", "hip"}
-    return torch_autocast(device_type if device_type != "hip" else "cuda", dtype=dtype, enabled=enabled)
-
-
-def _run_vae_encode(vae, batch: torch.Tensor) -> torch.Tensor:
-    model = getattr(vae, "model", None)
-    scale = getattr(vae, "scale", None)
-    target_dtype = getattr(vae, "dtype", batch.dtype)
-    device_type = batch.device.type
-    if model is None or scale is None:
-        encoded = [vae.encode([sample])[0] for sample in batch]
-        return torch.stack(encoded, dim=0)
-    ctx = _vae_autocast_context(device_type, target_dtype)
-    with ctx:
-        encoded = model.encode(batch.to(target_dtype), scale)
-    return encoded.float()
-
-
-def _run_vae_decode(vae, batch: torch.Tensor) -> torch.Tensor:
-    model = getattr(vae, "model", None)
-    scale = getattr(vae, "scale", None)
-    target_dtype = getattr(vae, "dtype", batch.dtype)
-    device_type = batch.device.type
-    if model is None or scale is None:
-        decoded = vae.decode([sample for sample in batch])
-        return torch.stack(decoded, dim=0)
-    ctx = _vae_autocast_context(device_type, target_dtype)
-    with ctx:
-        decoded = model.decode(batch.to(target_dtype), scale)
-    return decoded.float().clamp_(-1, 1)
-
-
 # -------- minimal, fast tiling with small overlap --------
 
 @torch.no_grad()
@@ -76,8 +28,7 @@ def tiled_encode(
     vae,
     video: torch.Tensor,
     tile_px: int = 128,        # same as your original
-    overlap_px: int = 16,      # small halo; quantized to stride
-    tile_batch_size: int = 4,
+    overlap_px: int = 16       # small halo; quantized to stride
 ) -> torch.Tensor:
     """
     [3,T,H,W] or [1,3,T,H,W] -> latent [Cz,Tl,HL,WL]
@@ -95,35 +46,6 @@ def tiled_encode(
 
     out_sum = None
     out_cnt = None
-    batch_limit = max(1, int(tile_batch_size))
-
-    encode_groups: dict[tuple[int, int], list] = defaultdict(list)
-
-    def flush_group(key):
-        nonlocal out_sum, out_cnt
-        jobs = encode_groups[key]
-        if not jobs:
-            return
-        batch = torch.stack([job.pop("tile") for job in jobs], dim=0)
-        z_batch = _run_vae_encode(vae, batch)
-        for job, z_tile in zip(jobs, z_batch.unbind(0)):
-            z_core = z_tile[:, :, job["topL"]:job["topL"] + job["hL_core"],
-                            job["leftL"]:job["leftL"] + job["wL_core"]]
-            if out_sum is None:
-                Cz, Tl = z_tile.shape[:2]
-                HL_full = math.ceil(H / STRIDE_H)
-                WL_full = math.ceil(W / STRIDE_W)
-                dev = video.device
-                dtype = z_tile.dtype
-                out_sum = torch.zeros((Cz, Tl, HL_full, WL_full), device=dev, dtype=dtype)
-                out_cnt = torch.zeros((1, 1, HL_full, WL_full), device=dev, dtype=dtype)
-            yL0 = job["yL0"]
-            xL0 = job["xL0"]
-            hL = job["hL_core"]
-            wL = job["wL_core"]
-            out_sum[:, :, yL0:yL0 + hL, xL0:xL0 + wL] += z_core
-            out_cnt[:, :, yL0:yL0 + hL, xL0:xL0 + wL] += 1
-        jobs.clear()
 
     for y0 in range(0, H, th):
         ys0 = max(0, y0 - oy)
@@ -135,6 +57,8 @@ def tiled_encode(
             tile = video[:, :, ys0:ys1, xs0:xs1].contiguous()
             tile = _pad_to_stride(tile, STRIDE_H, STRIDE_W, mode="reflect")
 
+            z_tile = vae.encode([tile])[0]  # [Cz,Tl,*,*]
+
             h_core = min(th, H - y0)
             w_core = min(tw, W - x0)
             hL_core = math.ceil(h_core / STRIDE_H)
@@ -142,22 +66,21 @@ def tiled_encode(
 
             topL  = (y0 - ys0) // STRIDE_H
             leftL = (x0 - xs0) // STRIDE_W
-            job = dict(
-                tile=tile,
-                topL=topL,
-                leftL=leftL,
-                hL_core=hL_core,
-                wL_core=wL_core,
-                yL0=y0 // STRIDE_H,
-                xL0=x0 // STRIDE_W,
-            )
-            key = (tile.shape[-2], tile.shape[-1])
-            encode_groups[key].append(job)
-            if len(encode_groups[key]) >= batch_limit:
-                flush_group(key)
+            z_core = z_tile[:, :, topL:topL + hL_core, leftL:leftL + wL_core]
 
-    for key in list(encode_groups.keys()):
-        flush_group(key)
+            if out_sum is None:
+                Cz, Tl = z_tile.shape[:2]
+                HL_full = math.ceil(H / STRIDE_H)
+                WL_full = math.ceil(W / STRIDE_W)
+                dev = video.device; dtype = z_tile.dtype
+                out_sum = torch.zeros((Cz, Tl, HL_full, WL_full), device=dev, dtype=dtype)
+                out_cnt = torch.zeros((1, 1, HL_full, WL_full), device=dev, dtype=dtype)
+
+            yL0 = y0 // STRIDE_H
+            xL0 = x0 // STRIDE_W
+
+            out_sum[:, :, yL0:yL0 + hL_core, xL0:xL0 + wL_core] += z_core
+            out_cnt[:, :, yL0:yL0 + hL_core, xL0:xL0 + wL_core] += 1
 
     out = out_sum / out_cnt.clamp_min(1.0)
     return out
@@ -192,8 +115,7 @@ def tiled_decode(
     vae,
     latent: torch.Tensor,
     latent_tile: int = 16,     # ≈ 128px // 8
-    latent_overlap: int = 2,   # ≈ overlap_px // stride
-    latent_batch_size: int = 4,
+    latent_overlap: int = 2    # ≈ overlap_px // stride
 ) -> torch.Tensor:
     """
     latent [Cz,Tl,HL,WL] -> video [3,T,H,W]
@@ -226,36 +148,6 @@ def tiled_decode(
         out_sum[:, :, :hp, :wp] += probe * m0
         out_wsum[:, :, :hp, :wp] += m0
 
-    decode_groups: dict[tuple[int, int], list] = defaultdict(list)
-    latent_batch_limit = max(1, int(latent_batch_size))
-
-    def flush_decode(key):
-        jobs = decode_groups[key]
-        if not jobs:
-            return
-        batch = torch.stack([job.pop("latent") for job in jobs], dim=0)
-        tiles = _run_vae_decode(vae, batch)
-        for job, tile in zip(jobs, tiles.unbind(0)):
-            th, tw = tile.shape[-2], tile.shape[-1]
-            y_span = max(1, job["yb1"] - job["yb0"])
-            x_span = max(1, job["xb1"] - job["xb0"])
-            per_h = max(1, th // y_span)
-            per_w = max(1, tw // x_span)
-            yp0 = job["yb0"] * per_h
-            xp0 = job["xb0"] * per_w
-            yp1 = yp0 + th
-            xp1 = xp0 + tw
-            oy_px = ov * per_h
-            ox_px = ov * per_w
-            m = _linear_mask(th, tw, oy_px, ox_px, tile.device, tile.dtype)
-            if m is None:
-                out_sum[:, :, yp0:yp1, xp0:xp1] += tile
-                out_wsum[:, :, yp0:yp1, xp0:xp1] += 1
-            else:
-                out_sum[:, :, yp0:yp1, xp0:xp1] += tile * m
-                out_wsum[:, :, yp0:yp1, xp0:xp1] += m
-        jobs.clear()
-
     for y0 in range(0, HL, step):
         for x0 in range(0, WL, step):
             if y0 == 0 and x0 == 0:
@@ -264,20 +156,27 @@ def tiled_decode(
             xb0 = max(0, x0 - ov); xb1 = min(WL, x0 + step + ov)
 
             z = latent[:, :, yb0:yb1, xb0:xb1].contiguous()
-            job = dict(
-                latent=z,
-                yb0=yb0,
-                yb1=yb1,
-                xb0=xb0,
-                xb1=xb1,
-            )
-            key = (z.shape[-2], z.shape[-1])
-            decode_groups[key].append(job)
-            if len(decode_groups[key]) >= latent_batch_limit:
-                flush_decode(key)
+            tile = vae.decode([z])[0]  # [3,T,th,tw]
 
-    for key in list(decode_groups.keys()):
-        flush_decode(key)
+            th, tw = tile.shape[-2], tile.shape[-1]
+            per_h = max(1, th // (yb1 - yb0))
+            per_w = max(1, tw // (xb1 - xb0))
+
+            yp0 = yb0 * per_h
+            xp0 = xb0 * per_w
+            yp1 = yp0 + th
+            xp1 = xp0 + tw
+
+            oy_px = ov * per_h
+            ox_px = ov * per_w
+            m = _linear_mask(th, tw, oy_px, ox_px, tile.device, tile.dtype)
+
+            if m is None:
+                out_sum[:, :, yp0:yp1, xp0:xp1] += tile
+                out_wsum[:, :, yp0:yp1, xp0:xp1] += 1
+            else:
+                out_sum[:, :, yp0:yp1, xp0:xp1] += tile * m
+                out_wsum[:, :, yp0:yp1, xp0:xp1] += m
 
     out = out_sum / out_wsum.clamp_min(1e-8)
     return out
